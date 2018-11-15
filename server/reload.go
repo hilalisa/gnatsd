@@ -1,4 +1,15 @@
-// Copyright 2017 Apcera Inc. All rights reserved.
+// Copyright 2017-2018 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package server
 
@@ -27,18 +38,35 @@ type option interface {
 
 	// IsAuthChange indicates if this option requires reloading authorization.
 	IsAuthChange() bool
+
+	// IsClusterPermsChange indicates if this option requires reloading
+	// cluster permissions.
+	IsClusterPermsChange() bool
+}
+
+// noopOption is a base struct that provides default no-op behaviors.
+type noopOption struct{}
+
+func (n noopOption) IsLoggingChange() bool {
+	return false
+}
+
+func (n noopOption) IsAuthChange() bool {
+	return false
+}
+
+func (n noopOption) IsClusterPermsChange() bool {
+	return false
 }
 
 // loggingOption is a base struct that provides default option behaviors for
 // logging-related options.
-type loggingOption struct{}
+type loggingOption struct {
+	noopOption
+}
 
 func (l loggingOption) IsLoggingChange() bool {
 	return true
-}
-
-func (l loggingOption) IsAuthChange() bool {
-	return false
 }
 
 // traceOption implements the option interface for the `trace` setting.
@@ -108,17 +136,6 @@ func (r *remoteSyslogOption) Apply(server *Server) {
 	server.Noticef("Reloaded: remote_syslog = %v", r.newValue)
 }
 
-// noopOption is a base struct that provides default no-op behaviors.
-type noopOption struct{}
-
-func (n noopOption) IsLoggingChange() bool {
-	return false
-}
-
-func (n noopOption) IsAuthChange() bool {
-	return false
-}
-
 // tlsOption implements the option interface for the `tls` setting.
 type tlsOption struct {
 	noopOption
@@ -135,7 +152,6 @@ func (t *tlsOption) Apply(server *Server) {
 		server.info.TLSVerify = (t.newValue.ClientAuth == tls.RequireAndVerifyClientCert)
 		message = "enabled"
 	}
-	server.generateServerInfoJSON()
 	server.mu.Unlock()
 	server.Noticef("Reloaded: tls = %s", message)
 }
@@ -154,10 +170,8 @@ func (t *tlsTimeoutOption) Apply(server *Server) {
 }
 
 // authOption is a base struct that provides default option behaviors.
-type authOption struct{}
-
-func (o authOption) IsLoggingChange() bool {
-	return false
+type authOption struct {
+	noopOption
 }
 
 func (o authOption) IsAuthChange() bool {
@@ -215,17 +229,27 @@ func (a *authTimeoutOption) Apply(server *Server) {
 // setting.
 type usersOption struct {
 	authOption
-	newValue []*User
 }
 
 func (u *usersOption) Apply(server *Server) {
 	server.Noticef("Reloaded: authorization users")
 }
 
+// nkeysOption implements the option interface for the authorization `users`
+// setting.
+type nkeysOption struct {
+	authOption
+}
+
+func (u *nkeysOption) Apply(server *Server) {
+	server.Noticef("Reloaded: authorization nkey users")
+}
+
 // clusterOption implements the option interface for the `cluster` setting.
 type clusterOption struct {
 	authOption
-	newValue ClusterOpts
+	newValue     ClusterOpts
+	permsChanged bool
 }
 
 // Apply the cluster change.
@@ -234,12 +258,20 @@ func (c *clusterOption) Apply(server *Server) {
 	server.mu.Lock()
 	tlsRequired := c.newValue.TLSConfig != nil
 	server.routeInfo.TLSRequired = tlsRequired
-	server.routeInfo.SSLRequired = tlsRequired
 	server.routeInfo.TLSVerify = tlsRequired
 	server.routeInfo.AuthRequired = c.newValue.Username != ""
-	server.generateRouteInfoJSON()
+	if c.newValue.NoAdvertise {
+		server.routeInfo.ClientConnectURLs = nil
+	} else {
+		server.routeInfo.ClientConnectURLs = server.clientConnectURLs
+	}
+	server.setRouteInfoHostPortAndIP()
 	server.mu.Unlock()
 	server.Noticef("Reloaded: cluster")
+}
+
+func (c *clusterOption) IsClusterPermsChange() bool {
+	return c.permsChanged
 }
 
 // routesOption implements the option interface for the cluster `routes`
@@ -264,10 +296,16 @@ func (r *routesOption) Apply(server *Server) {
 	// Remove routes.
 	for _, remove := range r.remove {
 		for _, client := range routes {
-			if client.route.url == remove {
+			var url *url.URL
+			client.mu.Lock()
+			if client.route != nil {
+				url = client.route.url
+			}
+			client.mu.Unlock()
+			if url != nil && urlsAreEqual(url, remove) {
 				// Do not attempt to reconnect when route is removed.
 				client.setRouteNoReconnectOnClose()
-				client.closeConnection()
+				client.closeConnection(RouteRemoved)
 				server.Noticef("Removed route %v", remove)
 			}
 		}
@@ -336,6 +374,19 @@ func (p *pidFileOption) Apply(server *Server) {
 	server.Noticef("Reloaded: pid_file = %v", p.newValue)
 }
 
+// portsFileDirOption implements the option interface for the `portFileDir` setting.
+type portsFileDirOption struct {
+	noopOption
+	oldValue string
+	newValue string
+}
+
+func (p *portsFileDirOption) Apply(server *Server) {
+	server.deletePortsFile(p.oldValue)
+	server.logPorts()
+	server.Noticef("Reloaded: ports_file_dir = %v", p.newValue)
+}
+
 // maxControlLineOption implements the option interface for the
 // `max_control_line` setting.
 type maxControlLineOption struct {
@@ -360,7 +411,6 @@ type maxPayloadOption struct {
 func (m *maxPayloadOption) Apply(server *Server) {
 	server.mu.Lock()
 	server.info.MaxPayload = m.newValue
-	server.generateServerInfoJSON()
 	for _, client := range server.clients {
 		atomic.StoreInt64(&client.mpay, int64(m.newValue))
 	}
@@ -407,6 +457,31 @@ func (w *writeDeadlineOption) Apply(server *Server) {
 	server.Noticef("Reloaded: write_deadline = %s", w.newValue)
 }
 
+// clientAdvertiseOption implements the option interface for the `client_advertise` setting.
+type clientAdvertiseOption struct {
+	noopOption
+	newValue string
+}
+
+// Apply the setting by updating the server info and regenerate the infoJSON byte array.
+func (c *clientAdvertiseOption) Apply(server *Server) {
+	server.mu.Lock()
+	server.setInfoHostPortAndGenerateJSON()
+	server.mu.Unlock()
+	server.Noticef("Reload: client_advertise = %s", c.newValue)
+}
+
+// accountsOption implements the option interface.
+// Ensure that authorization code is executed if any change in accounts
+type accountsOption struct {
+	authOption
+}
+
+// Apply is a no-op. Changes will be applied in reloadAuthorization
+func (a *accountsOption) Apply(s *Server) {
+	s.Noticef("Reloaded: accounts")
+}
+
 // Reload reads the current configuration file and applies any supported
 // changes. This returns an error if the server was not started with a config
 // file or an option which doesn't support hot-swapping was changed.
@@ -422,11 +497,25 @@ func (s *Server) Reload() error {
 		// TODO: Dump previous good config to a .bak file?
 		return err
 	}
+	clientOrgPort := s.clientActualPort
+	clusterOrgPort := s.clusterActualPort
 	s.mu.Unlock()
 
 	// Apply flags over config file settings.
 	newOpts = MergeOptions(newOpts, FlagSnapshot)
 	processOptions(newOpts)
+
+	// processOptions sets Port to 0 if set to -1 (RANDOM port)
+	// If that's the case, set it to the saved value when the accept loop was
+	// created.
+	if newOpts.Port == 0 {
+		newOpts.Port = clientOrgPort
+	}
+	// We don't do that for cluster, so check against -1.
+	if newOpts.Cluster.Port == -1 {
+		newOpts.Cluster.Port = clusterOrgPort
+	}
+
 	if err := s.reloadOptions(newOpts); err != nil {
 		return err
 	}
@@ -443,6 +532,10 @@ func (s *Server) reloadOptions(newOpts *Options) error {
 	if err != nil {
 		return err
 	}
+	// Need to save off previous cluster permissions
+	s.mu.Lock()
+	s.oldClusterPerms = s.opts.Cluster.Permissions
+	s.mu.Unlock()
 	s.setOpts(newOpts)
 	s.applyOptions(changed)
 	return nil
@@ -494,13 +587,17 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 		case "authtimeout":
 			diffOpts = append(diffOpts, &authTimeoutOption{newValue: newValue.(float64)})
 		case "users":
-			diffOpts = append(diffOpts, &usersOption{newValue: newValue.([]*User)})
+			diffOpts = append(diffOpts, &usersOption{})
+		case "nkeys":
+			diffOpts = append(diffOpts, &nkeysOption{})
 		case "cluster":
 			newClusterOpts := newValue.(ClusterOpts)
-			if err := validateClusterOpts(oldValue.(ClusterOpts), newClusterOpts); err != nil {
+			oldClusterOpts := oldValue.(ClusterOpts)
+			if err := validateClusterOpts(oldClusterOpts, newClusterOpts); err != nil {
 				return nil, err
 			}
-			diffOpts = append(diffOpts, &clusterOption{newValue: newClusterOpts})
+			permsChanged := !reflect.DeepEqual(newClusterOpts.Permissions, oldClusterOpts.Permissions)
+			diffOpts = append(diffOpts, &clusterOption{newValue: newClusterOpts, permsChanged: permsChanged})
 		case "routes":
 			add, remove := diffRoutes(oldValue.([]*url.URL), newValue.([]*url.URL))
 			diffOpts = append(diffOpts, &routesOption{add: add, remove: remove})
@@ -508,6 +605,8 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			diffOpts = append(diffOpts, &maxConnOption{newValue: newValue.(int)})
 		case "pidfile":
 			diffOpts = append(diffOpts, &pidFileOption{newValue: newValue.(string)})
+		case "portsfiledir":
+			diffOpts = append(diffOpts, &portsFileDirOption{newValue: newValue.(string), oldValue: oldValue.(string)})
 		case "maxcontrolline":
 			diffOpts = append(diffOpts, &maxControlLineOption{newValue: newValue.(int)})
 		case "maxpayload":
@@ -518,8 +617,19 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			diffOpts = append(diffOpts, &maxPingsOutOption{newValue: newValue.(int)})
 		case "writedeadline":
 			diffOpts = append(diffOpts, &writeDeadlineOption{newValue: newValue.(time.Duration)})
-		case "nolog":
-			// Ignore NoLog option since it's not parsed and only used in
+		case "clientadvertise":
+			cliAdv := newValue.(string)
+			if cliAdv != "" {
+				// Validate ClientAdvertise syntax
+				if _, _, err := parseHostPort(cliAdv, 0); err != nil {
+					return nil, fmt.Errorf("invalid ClientAdvertise value of %s, err=%v", cliAdv, err)
+				}
+			}
+			diffOpts = append(diffOpts, &clientAdvertiseOption{newValue: cliAdv})
+		case "accounts":
+			diffOpts = append(diffOpts, &accountsOption{})
+		case "nolog", "nosigs":
+			// Ignore NoLog and NoSigs options since they are not parsed and only used in
 			// testing.
 			continue
 		case "port":
@@ -541,8 +651,9 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 
 func (s *Server) applyOptions(opts []option) {
 	var (
-		reloadLogging = false
-		reloadAuth    = false
+		reloadLogging      = false
+		reloadAuth         = false
+		reloadClusterPerms = false
 	)
 	for _, opt := range opts {
 		opt.Apply(s)
@@ -552,6 +663,9 @@ func (s *Server) applyOptions(opts []option) {
 		if opt.IsAuthChange() {
 			reloadAuth = true
 		}
+		if opt.IsClusterPermsChange() {
+			reloadClusterPerms = true
+		}
 	}
 
 	if reloadLogging {
@@ -559,6 +673,9 @@ func (s *Server) applyOptions(opts []option) {
 	}
 	if reloadAuth {
 		s.reloadAuthorization()
+	}
+	if reloadClusterPerms {
+		s.reloadClusterPermissions()
 	}
 
 	s.Noticef("Reloaded server configuration")
@@ -569,17 +686,61 @@ func (s *Server) applyOptions(opts []option) {
 // unauthorized subscriptions.
 func (s *Server) reloadAuthorization() {
 	s.mu.Lock()
+
 	s.configureAuthorization()
-	s.generateServerInfoJSON()
-	clients := make(map[uint64]*client, len(s.clients))
-	for i, client := range s.clients {
-		clients[i] = client
+
+	// This map will contain the names of accounts that have their streams
+	// import configuration changed.
+	awcsti := make(map[string]struct{}, len(s.opts.Accounts))
+
+	oldAccounts := s.accounts
+	s.accounts = make(map[string]*Account)
+	s.registerAccount(s.gacc)
+	for _, newAcc := range s.opts.Accounts {
+		if acc, ok := oldAccounts[newAcc.Name]; ok {
+			// If account exist in latest config, "transfer" the account's
+			// sublist to the new account object before registering it
+			// in s.accounts.
+			acc.mu.RLock()
+			sl := acc.sl
+			acc.mu.RUnlock()
+			newAcc.mu.Lock()
+			newAcc.sl = sl
+			// Check if current and new config of this account are same
+			// in term of stream imports.
+			if !acc.checkStreamImportsEqual(newAcc) {
+				awcsti[newAcc.Name] = struct{}{}
+			}
+			newAcc.mu.Unlock()
+		}
+		s.registerAccount(newAcc)
 	}
-	routes := make(map[uint64]*client, len(s.routes))
-	for i, route := range s.routes {
-		routes[i] = route
+	// Gather clients that changed accounts. We will close them and they
+	// will reconnect, doing the right thing.
+	var (
+		cclientsa [64]*client
+		cclients  = cclientsa[:0]
+		clientsa  [64]*client
+		clients   = clientsa[:0]
+		routesa   [64]*client
+		routes    = routesa[:0]
+	)
+	for _, client := range s.clients {
+		if s.clientHasMovedToDifferentAccount(client) {
+			cclients = append(cclients, client)
+		} else {
+			clients = append(clients, client)
+		}
+	}
+	for _, route := range s.routes {
+		routes = append(routes, route)
 	}
 	s.mu.Unlock()
+
+	// Close clients that have moved accounts
+	for _, client := range cclients {
+		client.closeConnection(ClientClosed)
+	}
 
 	for _, client := range clients {
 		// Disconnect any unauthorized clients.
@@ -587,18 +748,177 @@ func (s *Server) reloadAuthorization() {
 			client.authViolation()
 			continue
 		}
-
-		// Remove any unauthorized subscriptions.
-		s.removeUnauthorizedSubs(client)
+		// Remove any unauthorized subscriptions and check for account imports.
+		client.processSubsOnConfigReload(awcsti)
 	}
 
-	for _, client := range routes {
+	for _, route := range routes {
 		// Disconnect any unauthorized routes.
-		if !s.isRouterAuthorized(client) {
-			client.setRouteNoReconnectOnClose()
-			client.authViolation()
+		// Do this only for route that were accepted, not initiated
+		// because in the later case, we don't have the user name/password
+		// of the remote server.
+		if !route.isSolicitedRoute() && !s.isRouterAuthorized(route) {
+			route.setRouteNoReconnectOnClose()
+			route.authViolation()
 		}
 	}
+}
+
+// Returns true if given client current account has changed (or user
+// no longer exist) in the new config, false if the user did not
+// change account.
+// Server lock is held on entry.
+func (s *Server) clientHasMovedToDifferentAccount(c *client) bool {
+	var (
+		nu *NkeyUser
+		u  *User
+	)
+	if c.opts.Nkey != "" {
+		if s.nkeys != nil {
+			nu = s.nkeys[c.opts.Nkey]
+		}
+	} else if c.opts.Username != "" {
+		if s.users != nil {
+			u = s.users[c.opts.Username]
+		}
+	} else {
+		return false
+	}
+	// Get the current account name
+	c.mu.Lock()
+	var curAccName string
+	if c.acc != nil {
+		curAccName = c.acc.Name
+	}
+	c.mu.Unlock()
+	if nu != nil && nu.Account != nil {
+		return curAccName != nu.Account.Name
+	} else if u != nil && u.Account != nil {
+		return curAccName != u.Account.Name
+	}
+	// user/nkey no longer exists.
+	return true
+}
+
+// reloadClusterPermissions reconfigures the cluster's permssions
+// and set the permissions to all existing routes, sending an
+// update INFO protocol so that remote can resend their local
+// subs if needed, and sending local subs matching cluster's
+// import subjects.
+func (s *Server) reloadClusterPermissions() {
+	s.mu.Lock()
+	var (
+		infoJSON     []byte
+		oldPerms     = s.oldClusterPerms
+		newPerms     = s.opts.Cluster.Permissions
+		routes       = make(map[uint64]*client, len(s.routes))
+		withNewProto int
+	)
+	// We can clear this now that we have captured it with oldPerms.
+	s.oldClusterPerms = nil
+	// Get all connected routes
+	for i, route := range s.routes {
+		// Count the number of routes that can understand receiving INFO updates.
+		route.mu.Lock()
+		if route.opts.Protocol >= RouteProtoInfo {
+			withNewProto++
+		}
+		route.mu.Unlock()
+		routes[i] = route
+	}
+	// If new permissions is nil, then clear routeInfo import/export
+	if newPerms == nil {
+		s.routeInfo.Import = nil
+		s.routeInfo.Export = nil
+	} else {
+		s.routeInfo.Import = newPerms.Import
+		s.routeInfo.Export = newPerms.Export
+	}
+	// Regenerate route INFO
+	s.generateRouteInfoJSON()
+	infoJSON = s.routeInfoJSON
+	s.mu.Unlock()
+
+	// If there were no route, we are done
+	if len(routes) == 0 {
+		return
+	}
+
+	// If only older servers, simply close all routes and they will do the right
+	// thing on reconnect.
+	if withNewProto == 0 {
+		for _, route := range routes {
+			route.closeConnection(RouteRemoved)
+		}
+		return
+	}
+
+	// Fake clients to test cluster permissions
+	oldPermsTester := &client{}
+	oldPermsTester.setRoutePermissions(oldPerms)
+	newPermsTester := &client{}
+	newPermsTester.setRoutePermissions(newPerms)
+
+	var (
+		_localSubs       [4096]*subscription
+		localSubs        = _localSubs[:0]
+		subsNeedSUB      []*subscription
+		subsNeedUNSUB    []*subscription
+		deleteRoutedSubs []*subscription
+	)
+	// FIXME(dlc) - Change for accounts.
+	s.gacc.sl.localSubs(&localSubs)
+
+	// Go through all local subscriptions
+	for _, sub := range localSubs {
+		// Get all subs that can now be imported
+		subj := string(sub.subject)
+		couldImportThen := oldPermsTester.canImport(subj)
+		canImportNow := newPermsTester.canImport(subj)
+		if canImportNow {
+			// If we could not before, then will need to send a SUB protocol.
+			if !couldImportThen {
+				subsNeedSUB = append(subsNeedSUB, sub)
+			}
+		} else if couldImportThen {
+			// We were previously able to import this sub, but now
+			// we can't so we need to send an UNSUB protocol
+			subsNeedUNSUB = append(subsNeedUNSUB, sub)
+		}
+	}
+
+	for _, route := range routes {
+		route.mu.Lock()
+		// If route is to older server, simply close connection.
+		if route.opts.Protocol < RouteProtoInfo {
+			route.mu.Unlock()
+			route.closeConnection(RouteRemoved)
+			continue
+		}
+		route.setRoutePermissions(newPerms)
+		for _, sub := range route.subs {
+			// If we can't export, we need to drop the subscriptions that
+			// we have on behalf of this route.
+			subj := string(sub.subject)
+			if !route.canExport(subj) {
+				delete(route.subs, string(sub.sid))
+				deleteRoutedSubs = append(deleteRoutedSubs, sub)
+			}
+		}
+		// Send an update INFO, which will allow remote server to show
+		// our current route config in monitoring and resend subscriptions
+		// that we now possibly allow with a change of Export permissions.
+		route.sendInfo(infoJSON)
+		// Now send SUB and UNSUB protocols as needed.
+		closed := route.sendRouteSubProtos(subsNeedSUB, false, nil)
+		if !closed {
+			route.sendRouteUnSubProtos(subsNeedUNSUB, false, nil)
+		}
+		route.mu.Unlock()
+	}
+	// Remove as a batch all the subs that we have removed from each route.
+	// FIXME(dlc) - Change for accounts.
+	s.gacc.sl.RemoveBatch(deleteRoutedSubs)
 }
 
 // validateClusterOpts ensures the new ClusterOpts does not change host or
@@ -612,6 +932,12 @@ func validateClusterOpts(old, new ClusterOpts) error {
 		return fmt.Errorf("Config reload not supported for cluster port: old=%d, new=%d",
 			old.Port, new.Port)
 	}
+	// Validate Cluster.Advertise syntax
+	if new.Advertise != "" {
+		if _, _, err := parseHostPort(new.Advertise, 0); err != nil {
+			return fmt.Errorf("invalid Cluster.Advertise value of %s, err=%v", new.Advertise, err)
+		}
+	}
 	return nil
 }
 
@@ -622,7 +948,7 @@ func diffRoutes(old, new []*url.URL) (add, remove []*url.URL) {
 removeLoop:
 	for _, oldRoute := range old {
 		for _, newRoute := range new {
-			if oldRoute == newRoute {
+			if urlsAreEqual(oldRoute, newRoute) {
 				continue removeLoop
 			}
 		}
@@ -633,7 +959,7 @@ removeLoop:
 addLoop:
 	for _, newRoute := range new {
 		for _, oldRoute := range old {
-			if oldRoute == newRoute {
+			if urlsAreEqual(oldRoute, newRoute) {
 				continue addLoop
 			}
 		}

@@ -1,4 +1,15 @@
-// Copyright 2013-2016 Apcera Inc. All rights reserved.
+// Copyright 2013-2018 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 // Customized heavily from
 // https://github.com/BurntSushi/toml/blob/master/lex.go, which is based on
@@ -62,6 +73,9 @@ const (
 	sqStringStart     = '\''
 	sqStringEnd       = '\''
 	optValTerm        = ';'
+	topOptStart       = '{'
+	topOptValTerm     = ','
+	topOptTerm        = '}'
 	blockStart        = '('
 	blockEnd          = ')'
 )
@@ -87,12 +101,19 @@ type lexer struct {
 	// Used for processing escapable substrings in double-quoted and raw strings
 	stringParts   []string
 	stringStateFn stateFn
+
+	// lstart is the start position of the current line.
+	lstart int
+
+	// ilstart is the start position of the line from the current item.
+	ilstart int
 }
 
 type item struct {
 	typ  itemType
 	val  string
 	line int
+	pos  int
 }
 
 func (lx *lexer) nextItem() item {
@@ -133,8 +154,13 @@ func (lx *lexer) pop() stateFn {
 }
 
 func (lx *lexer) emit(typ itemType) {
-	lx.items <- item{typ, strings.Join(lx.stringParts, "") + lx.input[lx.start:lx.pos], lx.line}
+	val := strings.Join(lx.stringParts, "") + lx.input[lx.start:lx.pos]
+
+	// Position of item in line where it started.
+	pos := lx.pos - lx.ilstart - len(val)
+	lx.items <- item{typ, val, lx.line, pos}
 	lx.start = lx.pos
+	lx.ilstart = lx.lstart
 }
 
 func (lx *lexer) emitString() {
@@ -145,8 +171,11 @@ func (lx *lexer) emitString() {
 	} else {
 		finalString = lx.input[lx.start:lx.pos]
 	}
-	lx.items <- item{itemString, finalString, lx.line}
+	// Position of string in line where it started.
+	pos := lx.pos - lx.ilstart - len(finalString)
+	lx.items <- item{itemString, finalString, lx.line, pos}
 	lx.start = lx.pos
+	lx.ilstart = lx.lstart
 }
 
 func (lx *lexer) addCurrentStringPart(offset int) {
@@ -172,15 +201,20 @@ func (lx *lexer) next() (r rune) {
 
 	if lx.input[lx.pos] == '\n' {
 		lx.line++
+
+		// Mark start position of current line.
+		lx.lstart = lx.pos
 	}
 	r, lx.width = utf8.DecodeRuneInString(lx.input[lx.pos:])
 	lx.pos += lx.width
+
 	return r
 }
 
 // ignore skips over the pending input before this point.
 func (lx *lexer) ignore() {
 	lx.start = lx.pos
+	lx.ilstart = lx.lstart
 }
 
 // backup steps back one rune. Can be called only once per call of next.
@@ -207,10 +241,14 @@ func (lx *lexer) errorf(format string, values ...interface{}) stateFn {
 			values[i] = escapeSpecial(v)
 		}
 	}
+
+	// Position of error in current line.
+	pos := lx.pos - lx.lstart
 	lx.items <- item{
 		itemError,
 		fmt.Sprintf(format, values...),
 		lx.line,
+		pos,
 	}
 	return nil
 }
@@ -223,6 +261,8 @@ func lexTop(lx *lexer) stateFn {
 	}
 
 	switch r {
+	case topOptStart:
+		return lexSkip(lx, lexTop)
 	case commentHashStart:
 		lx.push(lexTop)
 		return lexCommentStart
@@ -269,7 +309,7 @@ func lexTopValueEnd(lx *lexer) stateFn {
 		fallthrough
 	case isWhitespace(r):
 		return lexTopValueEnd
-	case isNL(r) || r == eof || r == optValTerm:
+	case isNL(r) || r == eof || r == optValTerm || r == topOptValTerm || r == topOptTerm:
 		lx.ignore()
 		return lexTop
 	}
@@ -306,6 +346,12 @@ func lexDubQuotedKey(lx *lexer) stateFn {
 		lx.emit(itemKey)
 		lx.next()
 		return lexSkip(lx, lexKeyEnd)
+	} else if r == eof {
+		if lx.pos > lx.start {
+			return lx.errorf("Unexpected EOF.")
+		}
+		lx.emit(itemEOF)
+		return nil
 	}
 	lx.next()
 	return lexDubQuotedKey
@@ -318,6 +364,12 @@ func lexQuotedKey(lx *lexer) stateFn {
 		lx.emit(itemKey)
 		lx.next()
 		return lexSkip(lx, lexKeyEnd)
+	} else if r == eof {
+		if lx.pos > lx.start {
+			return lx.errorf("Unexpected EOF.")
+		}
+		lx.emit(itemEOF)
+		return nil
 	}
 	lx.next()
 	return lexQuotedKey
@@ -578,6 +630,8 @@ func lexMapKeyStart(lx *lexer) stateFn {
 	switch {
 	case isKeySeparator(r):
 		return lx.errorf("Unexpected key separator '%v'.", r)
+	case r == arrayEnd:
+		return lx.errorf("Unexpected array end '%v' processing map.", r)
 	case unicode.IsSpace(r):
 		lx.next()
 		return lexSkip(lx, lexMapKeyStart)
@@ -746,6 +800,12 @@ func lexQuotedString(lx *lexer) stateFn {
 		lx.next()
 		lx.ignore()
 		return lx.pop()
+	case r == eof:
+		if lx.pos > lx.start {
+			return lx.errorf("Unexpected EOF.")
+		}
+		lx.emit(itemEOF)
+		return nil
 	}
 	return lexQuotedString
 }
@@ -765,6 +825,12 @@ func lexDubQuotedString(lx *lexer) stateFn {
 		lx.next()
 		lx.ignore()
 		return lx.pop()
+	case r == eof:
+		if lx.pos > lx.start {
+			return lx.errorf("Unexpected EOF.")
+		}
+		lx.emit(itemEOF)
+		return nil
 	}
 	return lexDubQuotedString
 }
@@ -1015,7 +1081,7 @@ func lexFloat(lx *lexer) stateFn {
 // lexIPAddr consumes IP addrs, like 127.0.0.1:4222
 func lexIPAddr(lx *lexer) stateFn {
 	r := lx.next()
-	if unicode.IsDigit(r) || r == '.' || r == ':' {
+	if unicode.IsDigit(r) || r == '.' || r == ':' || r == '-' {
 		return lexIPAddr
 	}
 	lx.backup()
@@ -1113,7 +1179,7 @@ func (itype itemType) String() string {
 }
 
 func (item item) String() string {
-	return fmt.Sprintf("(%s, '%s', %d)", item.typ.String(), item.val, item.line)
+	return fmt.Sprintf("(%s, '%s', %d, %d)", item.typ.String(), item.val, item.line, item.pos)
 }
 
 func escapeSpecial(c rune) string {

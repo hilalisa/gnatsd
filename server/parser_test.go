@@ -1,4 +1,15 @@
-// Copyright 2012-2015 Apcera Inc. All rights reserved.
+// Copyright 2012-2018 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package server
 
@@ -93,15 +104,15 @@ func TestParsePong(t *testing.T) {
 	if err != nil || c.state != OP_START {
 		t.Fatalf("Unexpected: %d : %v\n", c.state, err)
 	}
-	if c.pout != 0 {
-		t.Fatalf("Unexpected pout value: %d vs 0\n", c.pout)
+	if c.ping.out != 0 {
+		t.Fatalf("Unexpected ping.out value: %d vs 0\n", c.ping.out)
 	}
 	err = c.parse(pong)
 	if err != nil || c.state != OP_START {
 		t.Fatalf("Unexpected: %d : %v\n", c.state, err)
 	}
-	if c.pout != 0 {
-		t.Fatalf("Unexpected pout value: %d vs 0\n", c.pout)
+	if c.ping.out != 0 {
+		t.Fatalf("Unexpected ping.out value: %d vs 0\n", c.ping.out)
 	}
 	// Should tolerate spaces
 	pong = []byte("PONG  \r")
@@ -115,26 +126,26 @@ func TestParsePong(t *testing.T) {
 	if err != nil || c.state != OP_START {
 		t.Fatalf("Unexpected: %d : %v\n", c.state, err)
 	}
-	if c.pout != 0 {
-		t.Fatalf("Unexpected pout value: %d vs 0\n", c.pout)
+	if c.ping.out != 0 {
+		t.Fatalf("Unexpected ping.out value: %d vs 0\n", c.ping.out)
 	}
 
 	// Should be adjusting c.pout (Pings Outstanding): reset to 0
 	c.state = OP_START
-	c.pout = 10
+	c.ping.out = 10
 	pong = []byte("PONG\r\n")
 	err = c.parse(pong)
 	if err != nil || c.state != OP_START {
 		t.Fatalf("Unexpected: %d : %v\n", c.state, err)
 	}
-	if c.pout != 0 {
-		t.Fatalf("Unexpected pout: %d vs 0\n", c.pout)
+	if c.ping.out != 0 {
+		t.Fatalf("Unexpected ping.out: %d vs 0\n", c.ping.out)
 	}
 }
 
 func TestParseConnect(t *testing.T) {
 	c := dummyClient()
-	connect := []byte("CONNECT {\"verbose\":false,\"pedantic\":true,\"ssl_required\":false}\r\n")
+	connect := []byte("CONNECT {\"verbose\":false,\"pedantic\":true,\"tls_required\":false}\r\n")
 	err := c.parse(connect)
 	if err != nil || c.state != OP_START {
 		t.Fatalf("Unexpected: %d : %v\n", c.state, err)
@@ -277,7 +288,7 @@ func TestParsePubArg(t *testing.T) {
 			subject: "foo", reply: "", size: 2222, szb: "2222"},
 	} {
 		t.Run(test.arg, func(t *testing.T) {
-			if err := c.processPub([]byte(test.arg)); err != nil {
+			if err := c.processPub(false, []byte(test.arg)); err != nil {
 				t.Fatalf("Unexpected parse error: %v\n", err)
 			}
 			if !bytes.Equal(c.pa.subject, []byte(test.subject)) {
@@ -300,18 +311,26 @@ func TestParsePubBadSize(t *testing.T) {
 	c := dummyClient()
 	// Setup localized max payload
 	c.mpay = 32768
-	if err := c.processPub([]byte("foo 2222222222222222")); err == nil {
+	if err := c.processPub(false, []byte("foo 2222222222222222")); err == nil {
 		t.Fatalf("Expected parse error for size too large")
 	}
 }
 
-func TestParseMsg(t *testing.T) {
+func TestParseRouteMsg(t *testing.T) {
 	c := dummyRouteClient()
 
-	pub := []byte("MSG foo RSID:1:2 5\r\nhello\r")
+	pub := []byte("MSG $foo foo 5\r\nhello\r")
 	err := c.parse(pub)
+	if err == nil {
+		t.Fatalf("Expected an error, got none")
+	}
+	pub = []byte("RMSG $foo foo 5\r\nhello\r")
+	err = c.parse(pub)
 	if err != nil || c.state != MSG_END {
 		t.Fatalf("Unexpected: %d : %v\n", c.state, err)
+	}
+	if !bytes.Equal(c.pa.account, []byte("$foo")) {
+		t.Fatalf("Did not parse account correctly: '$foo' vs '%s'\n", c.pa.account)
 	}
 	if !bytes.Equal(c.pa.subject, []byte("foo")) {
 		t.Fatalf("Did not parse subject correctly: 'foo' vs '%s'\n", c.pa.subject)
@@ -322,17 +341,17 @@ func TestParseMsg(t *testing.T) {
 	if c.pa.size != 5 {
 		t.Fatalf("Did not parse msg size correctly: 5 vs %d\n", c.pa.size)
 	}
-	if !bytes.Equal(c.pa.sid, []byte("RSID:1:2")) {
-		t.Fatalf("Did not parse sid correctly: 'RSID:1:2' vs '%s'\n", c.pa.sid)
-	}
 
 	// Clear snapshots
 	c.argBuf, c.msgBuf, c.state = nil, nil, OP_START
 
-	pub = []byte("MSG foo.bar RSID:1:2 INBOX.22 11\r\nhello world\r")
+	pub = []byte("RMSG $G foo.bar INBOX.22 11\r\nhello world\r")
 	err = c.parse(pub)
 	if err != nil || c.state != MSG_END {
 		t.Fatalf("Unexpected: %d : %v\n", c.state, err)
+	}
+	if !bytes.Equal(c.pa.account, []byte("$G")) {
+		t.Fatalf("Did not parse account correctly: '$G' vs '%s'\n", c.pa.account)
 	}
 	if !bytes.Equal(c.pa.subject, []byte("foo.bar")) {
 		t.Fatalf("Did not parse subject correctly: 'foo' vs '%s'\n", c.pa.subject)
@@ -343,44 +362,54 @@ func TestParseMsg(t *testing.T) {
 	if c.pa.size != 11 {
 		t.Fatalf("Did not parse msg size correctly: 11 vs %d\n", c.pa.size)
 	}
-}
 
-func testMsgArg(c *client, t *testing.T) {
-	if !bytes.Equal(c.pa.subject, []byte("foobar")) {
-		t.Fatalf("Mismatched subject: '%s'\n", c.pa.subject)
-	}
-	if !bytes.Equal(c.pa.szb, []byte("22")) {
-		t.Fatalf("Bad size buf: '%s'\n", c.pa.szb)
-	}
-	if c.pa.size != 22 {
-		t.Fatalf("Bad size: %d\n", c.pa.size)
-	}
-	if !bytes.Equal(c.pa.sid, []byte("RSID:22:1")) {
-		t.Fatalf("Bad sid: '%s'\n", c.pa.sid)
-	}
-}
+	// Clear snapshots
+	c.argBuf, c.msgBuf, c.state = nil, nil, OP_START
 
-func TestParseMsgArg(t *testing.T) {
-	c := dummyClient()
-	if err := c.processMsgArgs([]byte("foobar RSID:22:1 22")); err != nil {
-		t.Fatalf("Unexpected parse error: %v\n", err)
+	pub = []byte("RMSG $G foo.bar + reply baz 11\r\nhello world\r")
+	err = c.parse(pub)
+	if err != nil || c.state != MSG_END {
+		t.Fatalf("Unexpected: %d : %v\n", c.state, err)
 	}
-	testMsgArg(c, t)
-	if err := c.processMsgArgs([]byte(" foobar RSID:22:1 22")); err != nil {
-		t.Fatalf("Unexpected parse error: %v\n", err)
+	if !bytes.Equal(c.pa.account, []byte("$G")) {
+		t.Fatalf("Did not parse account correctly: '$G' vs '%s'\n", c.pa.account)
 	}
-	testMsgArg(c, t)
-	if err := c.processMsgArgs([]byte(" foobar   RSID:22:1 22 ")); err != nil {
-		t.Fatalf("Unexpected parse error: %v\n", err)
+	if !bytes.Equal(c.pa.subject, []byte("foo.bar")) {
+		t.Fatalf("Did not parse subject correctly: 'foo' vs '%s'\n", c.pa.subject)
 	}
-	testMsgArg(c, t)
-	if err := c.processMsgArgs([]byte("foobar   RSID:22:1  \t22")); err != nil {
-		t.Fatalf("Unexpected parse error: %v\n", err)
+	if !bytes.Equal(c.pa.reply, []byte("reply")) {
+		t.Fatalf("Did not parse reply correctly: 'reply' vs '%s'\n", c.pa.reply)
 	}
-	if err := c.processMsgArgs([]byte("foobar\t\tRSID:22:1\t22\r")); err != nil {
-		t.Fatalf("Unexpected parse error: %v\n", err)
+	if len(c.pa.queues) != 1 {
+		t.Fatalf("Expected 1 queue, got %d", len(c.pa.queues))
 	}
-	testMsgArg(c, t)
+	if !bytes.Equal(c.pa.queues[0], []byte("baz")) {
+		t.Fatalf("Did not parse queues correctly: 'baz' vs '%q'\n", c.pa.queues[0])
+	}
+
+	// Clear snapshots
+	c.argBuf, c.msgBuf, c.state = nil, nil, OP_START
+
+	pub = []byte("RMSG $G foo.bar | baz 11\r\nhello world\r")
+	err = c.parse(pub)
+	if err != nil || c.state != MSG_END {
+		t.Fatalf("Unexpected: %d : %v\n", c.state, err)
+	}
+	if !bytes.Equal(c.pa.account, []byte("$G")) {
+		t.Fatalf("Did not parse account correctly: '$G' vs '%s'\n", c.pa.account)
+	}
+	if !bytes.Equal(c.pa.subject, []byte("foo.bar")) {
+		t.Fatalf("Did not parse subject correctly: 'foo' vs '%s'\n", c.pa.subject)
+	}
+	if !bytes.Equal(c.pa.reply, []byte("")) {
+		t.Fatalf("Did not parse reply correctly: '' vs '%s'\n", c.pa.reply)
+	}
+	if len(c.pa.queues) != 1 {
+		t.Fatalf("Expected 1 queue, got %d", len(c.pa.queues))
+	}
+	if !bytes.Equal(c.pa.queues[0], []byte("baz")) {
+		t.Fatalf("Did not parse queues correctly: 'baz' vs '%q'\n", c.pa.queues[0])
+	}
 }
 
 func TestParseMsgSpace(t *testing.T) {

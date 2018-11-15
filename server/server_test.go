@@ -1,4 +1,15 @@
-// Copyright 2015-2016 Apcera Inc. All rights reserved.
+// Copyright 2012-2018 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package server
 
@@ -6,16 +17,34 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/nats-io/go-nats"
 )
 
+func checkFor(t *testing.T, totalWait, sleepDur time.Duration, f func() error) {
+	t.Helper()
+	timeout := time.Now().Add(totalWait)
+	var err error
+	for time.Now().Before(timeout) {
+		err = f()
+		if err == nil {
+			return
+		}
+		time.Sleep(sleepDur)
+	}
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+}
+
 func DefaultOptions() *Options {
 	return &Options{
-		Host:     "localhost",
+		Host:     "127.0.0.1",
 		Port:     -1,
 		HTTPPort: -1,
 		Cluster:  ClusterOpts{Port: -1},
@@ -49,6 +78,40 @@ func RunServer(opts *Options) *Server {
 		panic("Unable to start NATS Server in Go Routine")
 	}
 	return s
+}
+
+// LoadConfig loads a configuration from a filename
+func LoadConfig(configFile string) (opts *Options) {
+	opts, err := ProcessConfigFile(configFile)
+	if err != nil {
+		panic(fmt.Sprintf("Error processing configuration file: %v", err))
+	}
+	opts.NoSigs, opts.NoLog = true, true
+	return
+}
+
+// RunServerWithConfig starts a new Go routine based server with a configuration file.
+func RunServerWithConfig(configFile string) (srv *Server, opts *Options) {
+	opts = LoadConfig(configFile)
+	srv = RunServer(opts)
+	return
+}
+
+func TestVersionMatchesTag(t *testing.T) {
+	tag := os.Getenv("TRAVIS_TAG")
+	if tag == "" {
+		t.SkipNow()
+	}
+	// We expect a tag of the form vX.Y.Z. If that's not the case,
+	// we need someone to have a look. So fail if first letter is not
+	// a `v`
+	if tag[0] != 'v' {
+		t.Fatalf("Expect tag to start with `v`, tag is: %s", tag)
+	}
+	// Strip the `v` from the tag for the version comparison.
+	if VERSION != tag[1:] {
+		t.Fatalf("Version (%s) does not match tag (%s)", VERSION, tag[1:])
+	}
 }
 
 func TestStartProfiler(t *testing.T) {
@@ -153,7 +216,9 @@ func TestGetConnectURLs(t *testing.T) {
 		s := New(opts)
 		defer s.Shutdown()
 
+		s.mu.Lock()
 		urls := s.getClientConnectURLs()
+		s.mu.Unlock()
 		if len(urls) == 0 {
 			t.Fatalf("Expected to get a list of urls, got none for listen addr: %v", opts.Host)
 		}
@@ -189,7 +254,9 @@ func TestGetConnectURLs(t *testing.T) {
 		s := New(opts)
 		defer s.Shutdown()
 
+		s.mu.Lock()
 		urls := s.getClientConnectURLs()
+		s.mu.Unlock()
 		if len(urls) != 1 {
 			t.Fatalf("Expected one URL, got %v", urls)
 		}
@@ -213,12 +280,81 @@ func TestGetConnectURLs(t *testing.T) {
 	}
 }
 
+func TestClientAdvertiseConnectURL(t *testing.T) {
+	opts := DefaultOptions()
+	opts.Port = 4222
+	opts.ClientAdvertise = "nats.example.com"
+	s := New(opts)
+	defer s.Shutdown()
+
+	s.mu.Lock()
+	urls := s.getClientConnectURLs()
+	s.mu.Unlock()
+	if len(urls) != 1 {
+		t.Fatalf("Expected to get one url, got none: %v with ClientAdvertise %v",
+			opts.Host, opts.ClientAdvertise)
+	}
+	if urls[0] != "nats.example.com:4222" {
+		t.Fatalf("Expected to get '%s', got: '%v'", "nats.example.com:4222", urls[0])
+	}
+	s.Shutdown()
+
+	opts.ClientAdvertise = "nats.example.com:7777"
+	s = New(opts)
+	s.mu.Lock()
+	urls = s.getClientConnectURLs()
+	s.mu.Unlock()
+	if len(urls) != 1 {
+		t.Fatalf("Expected to get one url, got none: %v with ClientAdvertise %v",
+			opts.Host, opts.ClientAdvertise)
+	}
+	if urls[0] != "nats.example.com:7777" {
+		t.Fatalf("Expected 'nats.example.com:7777', got: '%v'", urls[0])
+	}
+	if s.info.Host != "nats.example.com" {
+		t.Fatalf("Expected host to be set to nats.example.com")
+	}
+	if s.info.Port != 7777 {
+		t.Fatalf("Expected port to be set to 7777")
+	}
+	s.Shutdown()
+
+	opts = DefaultOptions()
+	opts.Port = 0
+	opts.ClientAdvertise = "nats.example.com:7777"
+	s = New(opts)
+	if s.info.Host != "nats.example.com" && s.info.Port != 7777 {
+		t.Fatalf("Expected Client Advertise Host:Port to be nats.example.com:7777, got: %s:%d",
+			s.info.Host, s.info.Port)
+	}
+	s.Shutdown()
+}
+
+func TestClientAdvertiseErrorOnStartup(t *testing.T) {
+	opts := DefaultOptions()
+	// Set invalid address
+	opts.ClientAdvertise = "addr:::123"
+	s := New(opts)
+	defer s.Shutdown()
+	dl := &DummyLogger{}
+	s.SetLogger(dl, false, false)
+
+	// Expect this to return due to failure
+	s.Start()
+	dl.Lock()
+	msg := dl.msg
+	dl.Unlock()
+	if !strings.Contains(msg, "ClientAdvertise") {
+		t.Fatalf("Unexpected error: %v", msg)
+	}
+}
+
 func TestNoDeadlockOnStartFailure(t *testing.T) {
 	opts := DefaultOptions()
 	opts.Host = "x.x.x.x" // bad host
 	opts.Port = 4222
 	opts.HTTPHost = opts.Host
-	opts.Cluster.Host = "localhost"
+	opts.Cluster.Host = "127.0.0.1"
 	opts.Cluster.Port = -1
 	opts.ProfPort = -1
 	s := New(opts)
@@ -248,6 +384,33 @@ func TestMaxConnections(t *testing.T) {
 	if err == nil {
 		nc2.Close()
 		t.Fatal("Expected connection to fail")
+	}
+}
+
+func TestMaxSubscriptions(t *testing.T) {
+	opts := DefaultOptions()
+	opts.MaxSubs = 10
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	addr := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
+	nc, err := nats.Connect(addr)
+	if err != nil {
+		t.Fatalf("Error creating client: %v\n", err)
+	}
+	defer nc.Close()
+
+	for i := 0; i < 10; i++ {
+		_, err := nc.Subscribe(fmt.Sprintf("foo.%d", i), func(*nats.Msg) {})
+		if err != nil {
+			t.Fatalf("Error subscribing: %v\n", err)
+		}
+	}
+	// This should cause the error.
+	nc.Subscribe("foo.22", func(*nats.Msg) {})
+	nc.Flush()
+	if err := nc.LastError(); err == nil {
+		t.Fatal("Expected an error but got none\n")
 	}
 }
 
@@ -300,7 +463,7 @@ func TestProcessCommandLineArgs(t *testing.T) {
 
 func TestWriteDeadline(t *testing.T) {
 	opts := DefaultOptions()
-	opts.WriteDeadline = 20 * time.Millisecond
+	opts.WriteDeadline = 30 * time.Millisecond
 	s := RunServer(opts)
 	defer s.Shutdown()
 
@@ -314,7 +477,7 @@ func TestWriteDeadline(t *testing.T) {
 	}
 	// Reduce socket buffer to increase reliability of getting
 	// write deadline errors.
-	c.(*net.TCPConn).SetReadBuffer(10)
+	c.(*net.TCPConn).SetReadBuffer(4)
 
 	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
 	sender, err := nats.Connect(url)
@@ -324,20 +487,16 @@ func TestWriteDeadline(t *testing.T) {
 	defer sender.Close()
 
 	payload := make([]byte, 1000000)
-	start := time.Now()
 	for i := 0; i < 10; i++ {
 		if err := sender.Publish("foo", payload); err != nil {
 			t.Fatalf("Error on publish: %v", err)
 		}
 	}
-	dur := time.Since(start)
-	// user more than the write deadline to account for calls
-	// overhead, running with -race, etc...
-	if dur > 110*time.Millisecond {
-		t.Fatalf("Flush should have returned sooner, took: %v", dur)
-	}
 	// Flush sender connection to ensure that all data has been sent.
-	sender.Flush()
+	if err := sender.Flush(); err != nil {
+		t.Fatalf("Error on flush: %v", err)
+	}
+
 	// At this point server should have closed connection c.
 
 	// On certain platforms, it may take more than one call before
@@ -427,19 +586,19 @@ func TestCustomRouterAuthentication(t *testing.T) {
 	opts2.Routes = RoutesFromStr(fmt.Sprintf("nats://invalid@127.0.0.1:%d", clusterPort))
 	s2 := RunServer(opts2)
 	defer s2.Shutdown()
-	if nr := s2.NumRoutes(); nr != 0 {
-		t.Fatalf("Expected no route, got %v", nr)
-	}
+
+	// s2 will attempt to connect to s, which should reject.
+	// Keep in mind that s2 will try again...
+	time.Sleep(50 * time.Millisecond)
+	checkNumRoutes(t, s2, 0)
 
 	opts3 := DefaultOptions()
 	opts3.Cluster.Host = "127.0.0.1"
 	opts3.Routes = RoutesFromStr(fmt.Sprintf("nats://valid@127.0.0.1:%d", clusterPort))
 	s3 := RunServer(opts3)
 	defer s3.Shutdown()
-	if nr := s3.NumRoutes(); nr != 1 {
-		t.Fatalf("Expected 1 route, got %v", nr)
-	}
-
+	checkClusterFormed(t, s, s3)
+	checkNumRoutes(t, s3, 1)
 }
 
 func TestMonitoringNoTimeout(t *testing.T) {
@@ -487,5 +646,204 @@ func TestProfilingNoTimeout(t *testing.T) {
 	}
 	if srv.WriteTimeout != 0 {
 		t.Fatalf("WriteTimeout should not be set, was set to %v", srv.WriteTimeout)
+	}
+}
+
+func TestLameDuckMode(t *testing.T) {
+	atomic.StoreInt64(&lameDuckModeInitialDelay, 0)
+	defer atomic.StoreInt64(&lameDuckModeInitialDelay, lameDuckModeDefaultInitialDelay)
+
+	optsA := DefaultOptions()
+	optsA.Cluster.Host = "127.0.0.1"
+	srvA := RunServer(optsA)
+	defer srvA.Shutdown()
+
+	// Check that if there is no client, server is shutdown
+	srvA.lameDuckMode()
+	srvA.mu.Lock()
+	shutdown := srvA.shutdown
+	srvA.mu.Unlock()
+	if !shutdown {
+		t.Fatalf("Server should have shutdown")
+	}
+
+	optsA.LameDuckDuration = 10 * time.Nanosecond
+	srvA = RunServer(optsA)
+	defer srvA.Shutdown()
+
+	optsB := DefaultOptions()
+	optsB.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", srvA.ClusterAddr().Port))
+	srvB := RunServer(optsB)
+	defer srvB.Shutdown()
+
+	checkClusterFormed(t, srvA, srvB)
+
+	total := 50
+	connectClients := func() []*nats.Conn {
+		ncs := make([]*nats.Conn, 0, total)
+		for i := 0; i < total; i++ {
+			nc, err := nats.Connect(fmt.Sprintf("nats://%s:%d", optsA.Host, optsA.Port),
+				nats.ReconnectWait(50*time.Millisecond))
+			if err != nil {
+				t.Fatalf("Error on connect: %v", err)
+			}
+			ncs = append(ncs, nc)
+		}
+		return ncs
+	}
+	stopClientsAndSrvB := func(ncs []*nats.Conn) {
+		for _, nc := range ncs {
+			nc.Close()
+		}
+		srvB.Shutdown()
+	}
+
+	ncs := connectClients()
+
+	checkClientsCount(t, srvA, total)
+	checkClientsCount(t, srvB, 0)
+
+	start := time.Now()
+	srvA.lameDuckMode()
+	// Make sure that nothing bad happens if called twice
+	srvA.lameDuckMode()
+	// Wait that shutdown completes
+	elapsed := time.Since(start)
+	// It should have taken more than the allotted time of 10ms since we had 50 clients.
+	if elapsed <= optsA.LameDuckDuration {
+		t.Fatalf("Expected to take more than %v, got %v", optsA.LameDuckDuration, elapsed)
+	}
+
+	checkClientsCount(t, srvA, 0)
+	checkClientsCount(t, srvB, total)
+
+	// Check closed status on server A
+	cz := pollConz(t, srvA, 1, "", &ConnzOptions{State: ConnClosed})
+	if n := len(cz.Conns); n != total {
+		t.Fatalf("Expected %v closed connections, got %v", total, n)
+	}
+	for _, c := range cz.Conns {
+		checkReason(t, c.Reason, ServerShutdown)
+	}
+
+	stopClientsAndSrvB(ncs)
+
+	optsA.LameDuckDuration = time.Second
+	srvA = RunServer(optsA)
+	defer srvA.Shutdown()
+
+	optsB.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", srvA.ClusterAddr().Port))
+	srvB = RunServer(optsB)
+	defer srvB.Shutdown()
+
+	checkClusterFormed(t, srvA, srvB)
+
+	ncs = connectClients()
+
+	checkClientsCount(t, srvA, total)
+	checkClientsCount(t, srvB, 0)
+
+	start = time.Now()
+	go srvA.lameDuckMode()
+	// Check that while in lameDuckMode, it is not possible to connect
+	// to the server. Wait to be in LD mode first
+	checkFor(t, 500*time.Millisecond, 15*time.Millisecond, func() error {
+		srvA.mu.Lock()
+		ldm := srvA.ldm
+		srvA.mu.Unlock()
+		if !ldm {
+			return fmt.Errorf("Did not reach lame duck mode")
+		}
+		return nil
+	})
+	if _, err := nats.Connect(fmt.Sprintf("nats://%s:%d", optsA.Host, optsA.Port)); err != nats.ErrNoServers {
+		t.Fatalf("Expected %v, got %v", nats.ErrNoServers, err)
+	}
+	srvA.grWG.Wait()
+	elapsed = time.Since(start)
+
+	checkClientsCount(t, srvA, 0)
+	checkClientsCount(t, srvB, total)
+
+	if elapsed > optsA.LameDuckDuration {
+		t.Fatalf("Expected to not take more than %v, got %v", optsA.LameDuckDuration, elapsed)
+	}
+
+	stopClientsAndSrvB(ncs)
+
+	// Now check that we can shutdown server while in LD mode.
+	optsA.LameDuckDuration = 60 * time.Second
+	srvA = RunServer(optsA)
+	defer srvA.Shutdown()
+
+	optsB.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", srvA.ClusterAddr().Port))
+	srvB = RunServer(optsB)
+	defer srvB.Shutdown()
+
+	checkClusterFormed(t, srvA, srvB)
+
+	ncs = connectClients()
+
+	checkClientsCount(t, srvA, total)
+	checkClientsCount(t, srvB, 0)
+
+	start = time.Now()
+	go srvA.lameDuckMode()
+	time.Sleep(100 * time.Millisecond)
+	srvA.Shutdown()
+	elapsed = time.Since(start)
+	// Make sure that it did not take that long
+	if elapsed > time.Second {
+		t.Fatalf("Took too long: %v", elapsed)
+	}
+	checkClientsCount(t, srvA, 0)
+	checkClientsCount(t, srvB, total)
+
+	stopClientsAndSrvB(ncs)
+
+	// Now test that we introduce delay before starting closing client connections.
+	// This allow to "signal" multiple servers and avoid their clients to reconnect
+	// to a server that is going to be going in LD mode.
+	atomic.StoreInt64(&lameDuckModeInitialDelay, int64(100*time.Millisecond))
+
+	optsA.LameDuckDuration = 10 * time.Millisecond
+	srvA = RunServer(optsA)
+	defer srvA.Shutdown()
+
+	optsB.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", srvA.ClusterAddr().Port))
+	optsB.LameDuckDuration = 10 * time.Millisecond
+	srvB = RunServer(optsB)
+	defer srvB.Shutdown()
+
+	optsC := DefaultOptions()
+	optsC.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", srvA.ClusterAddr().Port))
+	optsC.LameDuckDuration = 10 * time.Millisecond
+	srvC := RunServer(optsC)
+	defer srvC.Shutdown()
+
+	checkClusterFormed(t, srvA, srvB, srvC)
+
+	rt := int32(0)
+	nc, err := nats.Connect(fmt.Sprintf("nats://127.0.0.1:%d", optsA.Port),
+		nats.ReconnectWait(15*time.Millisecond),
+		nats.ReconnectHandler(func(*nats.Conn) {
+			atomic.AddInt32(&rt, 1)
+		}))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	go srvA.lameDuckMode()
+	// Wait a bit, but less than lameDuckModeInitialDelay that we set in this
+	// test to 100ms.
+	time.Sleep(30 * time.Millisecond)
+	go srvB.lameDuckMode()
+
+	srvA.grWG.Wait()
+	srvB.grWG.Wait()
+	checkClientsCount(t, srvC, 1)
+	if n := atomic.LoadInt32(&rt); n != 1 {
+		t.Fatalf("Expected client to reconnect only once, got %v", n)
 	}
 }

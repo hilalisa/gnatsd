@@ -1,9 +1,19 @@
-// Copyright 2013-2017 Apcera Inc. All rights reserved.
+// Copyright 2013-2018 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package server
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
@@ -11,12 +21,11 @@ import (
 	"math/rand"
 	"net"
 	"net/url"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
-
-	"github.com/nats-io/gnatsd/util"
 )
 
 // RouteType designates the router type
@@ -30,6 +39,20 @@ const (
 	Explicit
 )
 
+const (
+	// RouteProtoZero is the original Route protocol from 2009.
+	// http://nats.io/documentation/internals/nats-protocol/
+	RouteProtoZero = iota
+	// RouteProtoInfo signals a route can receive more then the original INFO block.
+	// This can be used to update remote cluster permissions, etc...
+	RouteProtoInfo
+	// RouteProtoV2 is the new route/cluster protocol that provides account support.
+	RouteProtoV2
+)
+
+// Used by tests
+var testRouteProto = RouteProtoV2
+
 type route struct {
 	remoteID     string
 	didSolicit   bool
@@ -39,9 +62,12 @@ type route struct {
 	authRequired bool
 	tlsRequired  bool
 	closed       bool
+	connectURLs  []string
+	replySubs    map[*subscription]*time.Timer
 }
 
 type connectInfo struct {
+	Echo     bool   `json:"echo"`
 	Verbose  bool   `json:"verbose"`
 	Pedantic bool   `json:"pedantic"`
 	User     string `json:"user,omitempty"`
@@ -56,6 +82,261 @@ const (
 	InfoProto = "INFO %s" + _CRLF_
 )
 
+// This will add a timer to watch over remote reply subjects in case
+// they fail to receive a response. The duration will be taken from the
+// accounts map timeout to match.
+// Lock should be held upon entering.
+func (c *client) addReplySubTimeout(acc *Account, sub *subscription, d time.Duration) {
+	if c.route.replySubs == nil {
+		c.route.replySubs = make(map[*subscription]*time.Timer)
+	}
+	rs := c.route.replySubs
+	rs[sub] = time.AfterFunc(d, func() {
+		c.mu.Lock()
+		delete(rs, sub)
+		sub.max = 0
+		c.mu.Unlock()
+		c.unsubscribe(acc, sub, true)
+	})
+}
+
+// removeReplySub is called when we trip the max on remoteReply subs.
+func (c *client) removeReplySub(sub *subscription) {
+	if sub == nil {
+		return
+	}
+	// Lookup the account based on sub.sid.
+	if i := bytes.Index(sub.sid, []byte(" ")); i > 0 {
+		// First part of SID for route is account name.
+		acc := c.srv.LookupAccount(string(sub.sid[:i]))
+		acc.sl.Remove(sub)
+		c.mu.Lock()
+		c.removeReplySubTimeout(sub)
+		c.mu.Unlock()
+	}
+}
+
+// removeReplySubTimeout will remove a timer if it exists.
+// Lock should be held upon entering.
+func (c *client) removeReplySubTimeout(sub *subscription) {
+	// Remove any reply sub timer if it exists.
+	if c.route.replySubs == nil {
+		return
+	}
+	if t, ok := c.route.replySubs[sub]; ok {
+		t.Stop()
+		delete(c.route.replySubs, sub)
+	}
+}
+
+func (c *client) processAccountSub(arg []byte) error {
+	// Placeholder in case we add in to the protocol active senders of
+	// informtation. For now we do not do account interest propagation.
+	c.traceInOp("A+", arg)
+	return nil
+}
+
+func (c *client) processAccountUnsub(arg []byte) {
+	// Placeholder in case we add in to the protocol active senders of
+	// informtation. For now we do not do account interest propagation.
+	c.traceInOp("A-", arg)
+}
+
+// Process an inbound RMSG specification from the remote route.
+func (c *client) processRoutedMsgArgs(trace bool, arg []byte) error {
+	if trace {
+		c.traceInOp("RMSG", arg)
+	}
+
+	// Unroll splitArgs to avoid runtime/heap issues
+	a := [MAX_MSG_ARGS][]byte{}
+	args := a[:0]
+	start := -1
+	for i, b := range arg {
+		switch b {
+		case ' ', '\t', '\r', '\n':
+			if start >= 0 {
+				args = append(args, arg[start:i])
+				start = -1
+			}
+		default:
+			if start < 0 {
+				start = i
+			}
+		}
+	}
+	if start >= 0 {
+		args = append(args, arg[start:])
+	}
+
+	c.pa.arg = arg
+	switch len(args) {
+	case 0, 1, 2:
+		return fmt.Errorf("processRoutedMsgArgs Parse Error: '%s'", args)
+	case 3:
+		c.pa.reply = nil
+		c.pa.queues = nil
+		c.pa.szb = args[2]
+		c.pa.size = parseSize(args[2])
+	case 4:
+		c.pa.reply = args[2]
+		c.pa.queues = nil
+		c.pa.szb = args[3]
+		c.pa.size = parseSize(args[3])
+	default:
+		// args[2] is our reply indicator. Should be + or | normally.
+		if len(args[2]) != 1 {
+			return fmt.Errorf("processRoutedMsgArgs Bad or Missing Reply Indicator: '%s'", args[2])
+		}
+		switch args[2][0] {
+		case '+':
+			c.pa.reply = args[3]
+		case '|':
+			c.pa.reply = nil
+		default:
+			return fmt.Errorf("processRoutedMsgArgs Bad or Missing Reply Indicator: '%s'", args[2])
+		}
+		// Grab size.
+		c.pa.szb = args[len(args)-1]
+		c.pa.size = parseSize(c.pa.szb)
+
+		// Grab queue names.
+		if c.pa.reply != nil {
+			c.pa.queues = args[4 : len(args)-1]
+		} else {
+			c.pa.queues = args[3 : len(args)-1]
+		}
+	}
+	if c.pa.size < 0 {
+		return fmt.Errorf("processRoutedMsgArgs Bad or Missing Size: '%s'", args)
+	}
+
+	// Common ones processed after check for arg length
+	c.pa.account = args[0]
+	c.pa.subject = args[1]
+	c.pa.rcache = arg[:len(args[0])+len(args[1])+1]
+	return nil
+}
+
+const (
+	maxRouteCacheSize   = 32768
+	pruneRouteCacheSize = 512
+)
+
+// routeCache is for L1 semantics for inbound messages from a route to mimic the performance of clients.
+type routeCache struct {
+	acc     *Account
+	results *SublistResult
+	genid   uint64
+}
+
+// pruneRouteCache will prune off a random number of cache entries.
+func (c *client) pruneRouteCache() {
+	n := 0
+	for cacheKey := range c.in.rcache {
+		delete(c.in.rcache, cacheKey)
+		if n++; n > pruneRouteCacheSize {
+			break
+		}
+	}
+}
+
+// processInboundRouteMsg is called to process an inbound msg from a route.
+func (c *client) processInboundRoutedMsg(msg []byte) {
+	// Update statistics
+	c.in.msgs++
+	// The msg includes the CR_LF, so pull back out for accounting.
+	c.in.bytes += len(msg) - LEN_CR_LF
+
+	if c.trace {
+		c.traceMsg(msg)
+	}
+
+	if c.opts.Verbose {
+		c.sendOK()
+	}
+
+	// Mostly under testing scenarios.
+	if c.srv == nil {
+		return
+	}
+
+	var (
+		acc *Account
+		rc  *routeCache
+		r   *SublistResult
+		ok  bool
+	)
+
+	// Check our cache first.
+	if rc, ok = c.in.rcache[string(c.pa.rcache)]; ok {
+		// Check the genid to see if it's still valid.
+		if genid := atomic.LoadUint64(&rc.acc.sl.genid); genid != rc.genid {
+			ok = false
+			delete(c.in.rcache, string(c.pa.rcache))
+		} else {
+			acc = rc.acc
+			r = rc.results
+		}
+	}
+
+	if !ok {
+		// Match correct account and sublist.
+		acc = c.srv.LookupAccount(string(c.pa.account))
+		if acc == nil {
+			c.Debugf("Unknown account %q for routed message on subject: %q", c.pa.account, c.pa.subject)
+			return
+		}
+
+		// Match against the account sublist.
+		r = acc.sl.Match(string(c.pa.subject))
+
+		// Store in our cache
+		c.in.rcache[string(c.pa.rcache)] = &routeCache{acc, r, atomic.LoadUint64(&acc.sl.genid)}
+
+		// Check if we need to prune.
+		if len(c.in.rcache) > maxRouteCacheSize {
+			c.pruneRouteCache()
+		}
+	}
+
+	// Check to see if we need to map/route to another account.
+	if acc.imports.services != nil {
+		c.checkForImportServices(acc, msg)
+	}
+
+	// Check for no interest, short circuit if so.
+	// This is the fanout scale.
+	if len(r.psubs)+len(r.qsubs) == 0 {
+		return
+	}
+
+	// Check to see if we have a routed message with a service reply.
+	if isServiceReply(c.pa.reply) && acc != nil {
+		// Need to add a sub here for local interest to send a response back
+		// to the originating server/requestor where it will be re-mapped.
+		sid := make([]byte, 0, len(acc.Name)+len(c.pa.reply)+1)
+		sid = append(sid, acc.Name...)
+		sid = append(sid, ' ')
+		sid = append(sid, c.pa.reply...)
+		// Copy off the reply since otherwise we are referencing a buffer that will be reused.
+		reply := make([]byte, len(c.pa.reply))
+		copy(reply, c.pa.reply)
+		sub := &subscription{client: c, subject: reply, sid: sid, max: 1}
+		if err := acc.sl.Insert(sub); err != nil {
+			c.Errorf("Could not insert subscription: %v", err)
+		} else {
+			ttl := acc.AutoExpireTTL()
+			c.mu.Lock()
+			c.subs[string(sid)] = sub
+			c.addReplySubTimeout(acc, sub, ttl)
+			c.mu.Unlock()
+		}
+	}
+
+	c.processMsgResults(acc, r, msg, c.pa.subject, c.pa.reply)
+}
+
 // Lock should be held entering here.
 func (c *client) sendConnect(tlsRequired bool) {
 	var user, pass string
@@ -64,6 +345,7 @@ func (c *client) sendConnect(tlsRequired bool) {
 		pass, _ = userInfo.Password()
 	}
 	cinfo := connectInfo{
+		Echo:     true,
 		Verbose:  false,
 		Pedantic: false,
 		User:     user,
@@ -71,10 +353,11 @@ func (c *client) sendConnect(tlsRequired bool) {
 		TLS:      tlsRequired,
 		Name:     c.srv.info.ID,
 	}
+
 	b, err := json.Marshal(cinfo)
 	if err != nil {
 		c.Errorf("Error marshaling CONNECT to route: %v\n", err)
-		c.closeConnection()
+		c.closeConnection(ProtocolViolation)
 		return
 	}
 	c.sendProto([]byte(fmt.Sprintf(ConProto, b)), true)
@@ -108,16 +391,31 @@ func (c *client) processRouteInfo(info *Info) {
 	// in closeConnection().
 	c.route.remoteID = info.ID
 
+	// Get the route's proto version
+	c.opts.Protocol = info.Proto
+
 	// Detect route to self.
 	if c.route.remoteID == s.info.ID {
 		c.mu.Unlock()
-		c.closeConnection()
+		c.closeConnection(DuplicateRoute)
 		return
 	}
 
 	// Copy over important information.
 	c.route.authRequired = info.AuthRequired
 	c.route.tlsRequired = info.TLSRequired
+
+	// If this is an update due to config reload on the remote server,
+	// need to possibly send local subs to the remote server.
+	if c.flags.isSet(infoReceived) {
+		s.updateRemoteRoutePerms(c, info)
+		c.mu.Unlock()
+		return
+	}
+
+	// Copy over permissions as well.
+	c.opts.Import = info.Import
+	c.opts.Export = info.Export
 
 	// If we do not know this route's URL, construct one on the fly
 	// from the information provided.
@@ -128,11 +426,15 @@ func (c *client) processRouteInfo(info *Info) {
 		if err != nil {
 			c.Errorf("Error parsing URL from INFO: %v\n", err)
 			c.mu.Unlock()
-			c.closeConnection()
+			c.closeConnection(ParseError)
 			return
 		}
 		c.route.url = url
 	}
+
+	// Mark that the INFO protocol has been received. Will allow
+	// to detect INFO updates.
+	c.flags.set(infoReceived)
 
 	// Check to see if we have this remote already registered.
 	// This can happen when both servers have routes to each other.
@@ -140,77 +442,99 @@ func (c *client) processRouteInfo(info *Info) {
 
 	if added, sendInfo := s.addRoute(c, info); added {
 		c.Debugf("Registering remote route %q", info.ID)
-		// Send our local subscriptions to this route.
-		s.sendLocalSubsToRoute(c)
+
+		// Send our subs to the other side.
+		s.sendSubsToRoute(c)
+
 		// sendInfo will be false if the route that we just accepted
 		// is the only route there is.
 		if sendInfo {
-			// Need to get the remote IP address.
-			c.mu.Lock()
-			switch conn := c.nc.(type) {
-			case *net.TCPConn, *tls.Conn:
-				addr := conn.RemoteAddr().(*net.TCPAddr)
-				info.IP = fmt.Sprintf("nats-route://%s/", net.JoinHostPort(addr.IP.String(), strconv.Itoa(info.Port)))
-			default:
-				info.IP = c.route.url.String()
+			// The incoming INFO from the route will have IP set
+			// if it has Cluster.Advertise. In that case, use that
+			// otherwise contruct it from the remote TCP address.
+			if info.IP == "" {
+				// Need to get the remote IP address.
+				c.mu.Lock()
+				switch conn := c.nc.(type) {
+				case *net.TCPConn, *tls.Conn:
+					addr := conn.RemoteAddr().(*net.TCPAddr)
+					info.IP = fmt.Sprintf("nats-route://%s/", net.JoinHostPort(addr.IP.String(),
+						strconv.Itoa(info.Port)))
+				default:
+					info.IP = c.route.url.String()
+				}
+				c.mu.Unlock()
 			}
-			c.mu.Unlock()
 			// Now let the known servers know about this new route
 			s.forwardNewRouteInfoToKnownServers(info)
 		}
-		// Unless disabled, possibly update the server's INFO protcol
+		// Unless disabled, possibly update the server's INFO protocol
 		// and send to clients that know how to handle async INFOs.
 		if !s.getOpts().Cluster.NoAdvertise {
-			s.updateServerINFO(info.ClientConnectURLs)
-			s.sendAsyncInfoToClients()
+			s.addClientConnectURLsAndSendINFOToClients(info.ClientConnectURLs)
 		}
 	} else {
 		c.Debugf("Detected duplicate remote route %q", info.ID)
-		c.closeConnection()
+		c.closeConnection(DuplicateRoute)
 	}
+}
+
+// Possibly sends local subscriptions interest to this route
+// based on changes in the remote's Export permissions.
+// Lock assumed held on entry
+func (s *Server) updateRemoteRoutePerms(route *client, info *Info) {
+	// Interested only on Export permissions for the remote server.
+	// Create "fake" clients that we will use to check permissions
+	// using the old permissions...
+	oldPerms := &RoutePermissions{Export: route.opts.Export}
+	oldPermsTester := &client{}
+	oldPermsTester.setRoutePermissions(oldPerms)
+	// and the new ones.
+	newPerms := &RoutePermissions{Export: info.Export}
+	newPermsTester := &client{}
+	newPermsTester.setRoutePermissions(newPerms)
+
+	route.opts.Import = info.Import
+	route.opts.Export = info.Export
+
+	var (
+		_localSubs [4096]*subscription
+		localSubs  = _localSubs[:0]
+	)
+	// FIXME(dlc) - Add account scoping.
+	s.gacc.sl.localSubs(&localSubs)
+
+	route.sendRouteSubProtos(localSubs, false, func(sub *subscription) bool {
+		subj := string(sub.subject)
+		// If the remote can now export but could not before, and this server can import this
+		// subject, then send SUB protocol.
+		if newPermsTester.canExport(subj) && !oldPermsTester.canExport(subj) && route.canImport(subj) {
+			return true
+		}
+		return false
+	})
 }
 
 // sendAsyncInfoToClients sends an INFO protocol to all
 // connected clients that accept async INFO updates.
+// The server lock is held on entry.
 func (s *Server) sendAsyncInfoToClients() {
-	s.mu.Lock()
 	// If there are no clients supporting async INFO protocols, we are done.
-	if s.cproto == 0 {
-		s.mu.Unlock()
+	// Also don't send if we are shutting down...
+	if s.cproto == 0 || s.shutdown {
 		return
 	}
 
-	// Capture under lock
-	proto := s.infoJSON
-
-	// Make a copy of ALL clients so we can release server lock while
-	// sending the protocol to clients. We could check the conditions
-	// (proto support, first PONG sent) here and so have potentially
-	// a limited number of clients, but that would mean grabbing the
-	// client's lock here, which we don't want since we would still
-	// need it in the second loop.
-	clients := make([]*client, 0, len(s.clients))
 	for _, c := range s.clients {
-		clients = append(clients, c)
-	}
-	s.mu.Unlock()
-
-	for _, c := range clients {
 		c.mu.Lock()
-		// If server did not yet receive the CONNECT protocol, check later
-		// when sending the first PONG.
-		if !c.flags.isSet(connectReceived) {
-			c.flags.set(infoUpdated)
-		} else if c.opts.Protocol >= ClientProtoInfo {
-			// Send only if first PONG was sent
-			if c.flags.isSet(firstPongSent) {
-				// sendInfo takes care of checking if the connection is still
-				// valid or not, so don't duplicate tests here.
-				c.sendInfo(proto)
-			} else {
-				// Otherwise, notify that INFO has changed and check later.
-				c.flags.set(infoUpdated)
-			}
+		// Here, we are going to send only to the clients that are fully
+		// registered (server has received CONNECT and first PING). For
+		// clients that are not at this stage, this will happen in the
+		// processing of the first PING (see client.processPing)
+		if c.opts.Protocol >= ClientProtoInfo && c.flags.isSet(firstPongSent) {
+			// sendInfo takes care of checking if the connection is still
+			// valid or not, so don't duplicate tests here.
+			c.sendInfo(c.generateClientInfoJSON(s.copyInfo()))
 		}
 		c.mu.Unlock()
 	}
@@ -286,32 +610,401 @@ func (s *Server) forwardNewRouteInfoToKnownServers(info *Info) {
 	}
 }
 
-// This will send local subscription state to a new route connection.
-// FIXME(dlc) - This could be a DOS or perf issue with many clients
-// and large subscription space. Plus buffering in place not a good idea.
-func (s *Server) sendLocalSubsToRoute(route *client) {
-	b := bytes.Buffer{}
+// canImport is whether or not we will send a SUB for interest to the other side.
+// This is for ROUTER connections only.
+// Lock is held on entry.
+func (c *client) canImport(subject string) bool {
+	// Use pubAllowed() since this checks Publish permissions which
+	// is what Import maps to.
+	return c.pubAllowed(subject)
+}
+
+// canExport is whether or not we will accept a SUB from the remote for a given subject.
+// This is for ROUTER connections only.
+// Lock is held on entry
+func (c *client) canExport(subject string) bool {
+	// Use canSubscribe() since this checks Subscribe permissions which
+	// is what Export maps to.
+	return c.canSubscribe(subject)
+}
+
+// Initialize or reset cluster's permissions.
+// This is for ROUTER connections only.
+// Client lock is held on entry
+func (c *client) setRoutePermissions(perms *RoutePermissions) {
+	// Reset if some were set
+	if perms == nil {
+		c.perms = nil
+		c.mperms = nil
+		return
+	}
+	// Convert route permissions to user permissions.
+	// The Import permission is mapped to Publish
+	// and Export permission is mapped to Subscribe.
+	// For meaning of Import/Export, see canImport and canExport.
+	p := &Permissions{
+		Publish:   perms.Import,
+		Subscribe: perms.Export,
+	}
+	c.setPermissions(p)
+}
+
+// Type used to hold a list of subs on a per account basis.
+type asubs struct {
+	acc  *Account
+	subs []*subscription
+}
+
+// removeRemoteSubs will walk the subs and remove them from the appropriate account.
+func (c *client) removeRemoteSubs() {
+	// We need to gather these on a per account basis.
+	// FIXME(dlc) - We should be smarter about this..
+	as := map[string]*asubs{}
+	c.mu.Lock()
+	srv := c.srv
+	subs := c.subs
+	c.subs = make(map[string]*subscription)
+	c.mu.Unlock()
+
+	for key, sub := range subs {
+		c.mu.Lock()
+		sub.max = 0
+		c.mu.Unlock()
+		// Grab the account
+		accountName := strings.Fields(key)[0]
+		ase := as[accountName]
+		if ase == nil {
+			acc := srv.LookupAccount(accountName)
+			if acc == nil {
+				continue
+			}
+			as[accountName] = &asubs{acc: acc, subs: []*subscription{sub}}
+		} else {
+			ase.subs = append(ase.subs, sub)
+		}
+	}
+
+	// Now remove the subs by batch for each account sublist.
+	for _, ase := range as {
+		c.Debugf("Removing %d subscriptions for account %q", len(ase.subs), ase.acc.Name)
+		ase.acc.sl.RemoveBatch(ase.subs)
+	}
+}
+
+// Indicates no more interest in the given account/subject for the remote side.
+func (c *client) processRemoteUnsub(arg []byte) (err error) {
+	c.traceInOp("RS-", arg)
+
+	// Indicate any activity, so pub and sub or unsubs.
+	c.in.subs++
+
+	srv := c.srv
+	if srv == nil {
+		return nil
+	}
+
+	args := splitArg(arg)
+	sub := &subscription{client: c}
+
+	switch len(args) {
+	case 2:
+		sub.queue = nil
+	case 3:
+		sub.queue = args[2]
+	default:
+		return fmt.Errorf("processRemoteUnSub Parse Error: '%s'", arg)
+	}
+	sub.subject = args[1]
+
+	// Lookup the account
+	accountName := string(args[0])
+	acc := c.srv.LookupAccount(accountName)
+	if acc == nil {
+		c.Debugf("Unknown account %q for subject %q", accountName, sub.subject)
+		// Mark this account as not interested since we received a RS- and we
+		// do not have any record of it.
+		return nil
+	}
+
+	c.mu.Lock()
+	if c.nc == nil {
+		c.mu.Unlock()
+		return nil
+	}
+
+	// We store local subs by account and subject and optionally queue name.
+	// RS- will have the arg exactly as the key.
+	key := string(arg)
+	if sub, ok := c.subs[key]; ok {
+		delete(c.subs, key)
+		acc.sl.Remove(sub)
+		c.removeReplySubTimeout(sub)
+	}
+	c.mu.Unlock()
+
+	if c.opts.Verbose {
+		c.sendOK()
+	}
+	return nil
+}
+
+func (c *client) processRemoteSub(argo []byte) (err error) {
+	c.traceInOp("RS+", argo)
+
+	// Indicate activity.
+	c.in.subs++
+
+	srv := c.srv
+	if srv == nil {
+		return nil
+	}
+
+	// Copy so we do not reference a potentially large buffer
+	arg := make([]byte, len(argo))
+	copy(arg, argo)
+
+	args := splitArg(arg)
+	sub := &subscription{client: c}
+
+	switch len(args) {
+	case 2:
+		sub.queue = nil
+	case 4:
+		sub.queue = args[2]
+		sub.qw = int32(parseSize(args[3]))
+	default:
+		return fmt.Errorf("processRemoteSub Parse Error: '%s'", arg)
+	}
+	sub.subject = args[1]
+
+	// Lookup the account
+	// FIXME(dlc) - This may start having lots of contention?
+	accountName := string(args[0])
+	acc := c.srv.LookupAccount(accountName)
+	if acc == nil {
+		if !srv.NewAccountsAllowed() {
+			c.Debugf("Unknown account %q for subject %q", accountName, sub.subject)
+			return nil
+		}
+		acc, _ = srv.LookupOrRegisterAccount(accountName)
+	}
+
+	c.mu.Lock()
+	if c.nc == nil {
+		c.mu.Unlock()
+		return nil
+	}
+
+	// Check permissions if applicable.
+	if !c.canExport(string(sub.subject)) {
+		c.mu.Unlock()
+		c.Debugf("Can not export %q, ignoring remote subscription request", sub.subject)
+		return nil
+	}
+
+	// Check if we have a maximum on the number of subscriptions.
+	if c.msubs > 0 && len(c.subs) >= c.msubs {
+		c.mu.Unlock()
+		c.maxSubsExceeded()
+		return nil
+	}
+
+	// We store local subs by account and subject and optionally queue name.
+	// If we have a queue it will have a trailing weight which we do not want.
+	if sub.queue != nil {
+		sub.sid = arg[:len(arg)-len(args[3])-1]
+	} else {
+		sub.sid = arg
+	}
+	key := string(sub.sid)
+	osub := c.subs[key]
+	if osub == nil {
+		c.subs[string(key)] = sub
+		// Now place into the account sl.
+		if err = acc.sl.Insert(sub); err != nil {
+			delete(c.subs, key)
+			c.mu.Unlock()
+			c.Errorf("Could not insert subscription: %v", err)
+			c.sendErr("Invalid Subscription")
+			return nil
+		}
+	} else if sub.queue != nil {
+		// For a queue we need to update the weight.
+		atomic.StoreInt32(&osub.qw, sub.qw)
+		acc.sl.UpdateRemoteQSub(osub)
+	}
+	c.mu.Unlock()
+
+	if c.opts.Verbose {
+		c.sendOK()
+	}
+	return nil
+}
+
+// sendSubsToRoute will send over our subject interest to
+// the remote side. For each account we will send the
+// complete interest for all subjects, both normal as a binary
+// and queue group weights.
+func (s *Server) sendSubsToRoute(route *client) {
+	// Send over our account subscriptions.
+	var _accs [4096]*Account
+	accs := _accs[:0]
+	// copy accounts into array first
 	s.mu.Lock()
-	for _, client := range s.clients {
-		client.mu.Lock()
-		subs := make([]*subscription, 0, len(client.subs))
-		for _, sub := range client.subs {
-			subs = append(subs, sub)
-		}
-		client.mu.Unlock()
-		for _, sub := range subs {
-			rsid := routeSid(sub)
-			proto := fmt.Sprintf(subProto, sub.subject, sub.queue, rsid)
-			b.WriteString(proto)
-		}
+	for _, a := range s.accounts {
+		accs = append(accs, a)
 	}
 	s.mu.Unlock()
 
-	route.mu.Lock()
-	defer route.mu.Unlock()
-	route.sendProto(b.Bytes(), true)
+	var raw [4096]*subscription
+	var closed bool
 
-	route.Debugf("Route sent local subscriptions")
+	route.mu.Lock()
+	for _, a := range accs {
+		subs := raw[:0]
+		a.mu.RLock()
+		for key, rme := range a.rm {
+			// FIXME(dlc) - Just pass rme around.
+			// Construct a sub on the fly
+			var qn []byte
+			subEnd := len(key)
+			if qi := rme.qi; qi > 0 {
+				subEnd = int(qi) - 1
+				qn = []byte(key[qi:])
+			}
+			sub := &subscription{subject: []byte(key[:subEnd]), queue: qn, qw: rme.n}
+			subs = append(subs, sub)
+
+		}
+		a.mu.RUnlock()
+
+		closed = route.sendRouteSubProtos(subs, false, func(sub *subscription) bool {
+			return route.canImport(string(sub.subject))
+		})
+
+		if closed {
+			route.mu.Unlock()
+			return
+		}
+	}
+	route.mu.Unlock()
+	if !closed {
+		route.Debugf("Sent local subscriptions to route")
+	}
+}
+
+// Sends SUBs protocols for the given subscriptions. If a filter is specified, it is
+// invoked for each subscription. If the filter returns false, the subscription is skipped.
+// This function may release the route's lock due to flushing of outbound data. A boolean
+// is returned to indicate if the connection has been closed during this call.
+// Lock is held on entry.
+func (c *client) sendRouteSubProtos(subs []*subscription, trace bool, filter func(sub *subscription) bool) bool {
+	return c.sendRouteSubOrUnSubProtos(subs, true, trace, filter)
+}
+
+// Sends UNSUBs protocols for the given subscriptions. If a filter is specified, it is
+// invoked for each subscription. If the filter returns false, the subscription is skipped.
+// This function may release the route's lock due to flushing of outbound data. A boolean
+// is returned to indicate if the connection has been closed during this call.
+// Lock is held on entry.
+func (c *client) sendRouteUnSubProtos(subs []*subscription, trace bool, filter func(sub *subscription) bool) bool {
+	return c.sendRouteSubOrUnSubProtos(subs, false, trace, filter)
+}
+
+// Low-level function that sends SUBs or UNSUBs protcols for the given subscriptions.
+// Use sendRouteSubProtos or sendRouteUnSubProtos instead for clarity.
+// Lock is held on entry.
+func (c *client) sendRouteSubOrUnSubProtos(subs []*subscription, isSubProto, trace bool, filter func(sub *subscription) bool) bool {
+	const staticBufSize = maxBufSize * 2
+	var (
+		_buf   [staticBufSize]byte // array on stack
+		buf    = _buf[:0]          // our buffer will initially point to the stack buffer
+		mbs    = staticBufSize     // max size of the buffer
+		mpMax  = int(c.out.mp / 2) // 50% of max_pending
+		closed bool
+	)
+	// We need to make sure that we stay below the user defined max pending bytes.
+	if mbs > mpMax {
+		mbs = mpMax
+	}
+	for _, sub := range subs {
+		if filter != nil && !filter(sub) {
+			continue
+		}
+		// Determine the account. If sub has an ImportMap entry, use that, otherwise scoped to
+		// client. Default to global if all else fails.
+		var accName string
+		if sub.im != nil {
+			accName = sub.im.acc.Name
+		} else if sub.client != nil && sub.client.acc != nil {
+			accName = sub.client.acc.Name
+		} else {
+			accName = globalAccountName
+		}
+
+		// Check if proto is going to fit.
+		curSize := len(buf)
+		// "RS+/- " + account + " " + subject + " " [+ queue + " " + weight] + CRLF
+		curSize += 4 + len(accName) + 1 + len(sub.subject) + 1 + 2
+		if len(sub.queue) > 0 {
+			curSize += len(sub.queue)
+			if isSubProto {
+				// Estimate weightlen in 1000s
+				curSize += 1 + 4
+			}
+		}
+		if curSize >= mbs {
+			if c.queueOutbound(buf) {
+				// Need to allocate new array
+				buf = make([]byte, 0, mbs)
+			} else {
+				// We can reuse previous buffer
+				buf = buf[:0]
+			}
+			// Update last activity because flushOutbound() will release
+			// the lock, which could cause pingTimer to think that this
+			// connection is stale otherwise.
+			c.last = time.Now()
+			c.flushOutbound()
+			if closed = c.flags.isSet(clearConnection); closed {
+				break
+			}
+		}
+		as := len(buf)
+		if isSubProto {
+			buf = append(buf, []byte("RS+ ")...)
+		} else {
+			buf = append(buf, []byte("RS- ")...)
+		}
+		buf = append(buf, []byte(accName)...)
+		buf = append(buf, ' ')
+		buf = append(buf, sub.subject...)
+		if len(sub.queue) > 0 {
+			buf = append(buf, ' ')
+			buf = append(buf, sub.queue...)
+			// Send our weight if we are a sub proto
+			if isSubProto {
+				buf = append(buf, ' ')
+				var b [12]byte
+				var i = len(b)
+				for l := sub.qw; l > 0; l /= 10 {
+					i--
+					b[i] = digits[l%10]
+				}
+				buf = append(buf, b[i:]...)
+			}
+		}
+		if trace {
+			c.traceOutOp("", buf[as:])
+		}
+		buf = append(buf, []byte(CR_LF)...)
+	}
+	if !closed && len(buf) > 0 {
+		c.queueOutbound(buf)
+		c.flushOutbound()
+		closed = c.flags.isSet(clearConnection)
+	}
+	return closed
 }
 
 func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
@@ -330,6 +1023,7 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 
 	// Grab server variables
 	s.mu.Lock()
+	s.generateRouteInfoJSON()
 	infoJSON := s.routeInfoJSON
 	authRequired := s.routeInfo.AuthRequired
 	tlsRequired := s.routeInfo.TLSRequired
@@ -341,16 +1035,23 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 	// Initialize
 	c.initClient()
 
+	// Initialize the route cache.
+	c.in.rcache = make(map[string]*routeCache, maxRouteCacheSize)
+
 	if didSolicit {
 		// Do this before the TLS code, otherwise, in case of failure
 		// and if route is explicit, it would try to reconnect to 'nil'...
 		r.url = rURL
+
+		// Set permissions associated with the route user (if applicable).
+		// No lock needed since we are already under client lock.
+		c.setRoutePermissions(opts.Cluster.Permissions)
 	}
 
 	// Check for TLS
 	if tlsRequired {
 		// Copy off the config to add in ServerName if we
-		tlsConfig := util.CloneTLSConfig(opts.Cluster.TLSConfig)
+		tlsConfig := opts.Cluster.TLSConfig.Clone()
 
 		// If we solicited, we will act like the client, otherwise the server.
 		if didSolicit {
@@ -375,7 +1076,7 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 		if err := conn.Handshake(); err != nil {
 			c.Errorf("TLS route handshake error: %v", err)
 			c.sendErr("Secure Connection - TLS Required")
-			c.closeConnection()
+			c.closeConnection(TLSHandshakeError)
 			return nil
 		}
 		// Reset the read deadline
@@ -389,9 +1090,6 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 			c.mu.Unlock()
 			return nil
 		}
-
-		// Rewrap bw
-		c.bw = bufio.NewWriterSize(c.nc, startBufSize)
 	}
 
 	// Do final client initialization
@@ -414,12 +1112,22 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 	if !running {
 		c.mu.Unlock()
 		c.setRouteNoReconnectOnClose()
-		c.closeConnection()
+		c.closeConnection(ServerShutdown)
 		return nil
+	}
+
+	// Check for Auth required state for incoming connections.
+	// Make sure to do this before spinning up readLoop.
+	if authRequired && !didSolicit {
+		ttl := secondsToDuration(opts.Cluster.AuthTimeout)
+		c.setAuthTimer(ttl)
 	}
 
 	// Spin up the read loop.
 	s.startGoRoutine(func() { c.readLoop() })
+
+	// Spin up the write loop.
+	s.startGoRoutine(c.writeLoop)
 
 	if tlsRequired {
 		c.Debugf("TLS handshake complete")
@@ -434,14 +1142,8 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 	}
 
 	// Send our info to the other side.
+	// Our new version requires dynamic information for accounts and a nonce.
 	c.sendInfo(infoJSON)
-
-	// Check for Auth required state for incoming connections.
-	if authRequired && !didSolicit {
-		ttl := secondsToDuration(opts.Cluster.AuthTimeout)
-		c.setAuthTimer(ttl)
-	}
-
 	c.mu.Unlock()
 
 	c.Noticef("Route connection created")
@@ -452,67 +1154,6 @@ const (
 	_CRLF_  = "\r\n"
 	_EMPTY_ = ""
 )
-
-const (
-	subProto   = "SUB %s %s %s" + _CRLF_
-	unsubProto = "UNSUB %s%s" + _CRLF_
-)
-
-// FIXME(dlc) - Make these reserved and reject if they come in as a sid
-// from a client connection.
-// Route constants
-const (
-	RSID  = "RSID"
-	QRSID = "QRSID"
-
-	QRSID_LEN = len(QRSID)
-)
-
-func (s *Server) routeSidQueueSubscriber(rsid []byte) (*subscription, bool) {
-	cid, sid, ok := parseRouteSid(rsid)
-	if !ok {
-		return nil, false
-	}
-
-	s.mu.Lock()
-	client := s.clients[cid]
-	s.mu.Unlock()
-
-	if client == nil {
-		return nil, true
-	}
-
-	client.mu.Lock()
-	sub, ok := client.subs[string(sid)]
-	client.mu.Unlock()
-	if ok {
-		return sub, true
-	}
-	return nil, true
-}
-
-func routeSid(sub *subscription) string {
-	var qi string
-	if len(sub.queue) > 0 {
-		qi = "Q"
-	}
-	return fmt.Sprintf("%s%s:%d:%s", qi, RSID, sub.client.cid, sub.sid)
-}
-
-func parseRouteSid(rsid []byte) (uint64, []byte, bool) {
-	if !bytes.HasPrefix(rsid, []byte(QRSID)) {
-		return 0, nil, false
-	}
-
-	// We don't care what's char of rsid[QRSID_LEN+1], it should be ':'
-	for i, count := QRSID_LEN+1, len(rsid); i < count; i++ {
-		switch rsid[i] {
-		case ':':
-			return uint64(parseInt64(rsid[QRSID_LEN+1 : i])), rsid[i+1:], true
-		}
-	}
-	return 0, nil, true
-}
 
 func (s *Server) addRoute(c *client, info *Info) (bool, bool) {
 	id := c.route.remoteID
@@ -525,13 +1166,17 @@ func (s *Server) addRoute(c *client, info *Info) (bool, bool) {
 	}
 	remote, exists := s.remotes[id]
 	if !exists {
-		// Remove from the temporary map
-		s.grMu.Lock()
-		delete(s.grTmpClients, c.cid)
-		s.grMu.Unlock()
-
 		s.routes[c.cid] = c
 		s.remotes[id] = c
+		c.mu.Lock()
+		c.route.connectURLs = info.ClientConnectURLs
+		cid := c.cid
+		c.mu.Unlock()
+
+		// Remove from the temporary map
+		s.grMu.Lock()
+		delete(s.grTmpClients, cid)
+		s.grMu.Unlock()
 
 		// we don't need to send if the only route is the one we just accepted.
 		sendInfo = len(s.routes) > 1
@@ -553,6 +1198,9 @@ func (s *Server) addRoute(c *client, info *Info) (bool, bool) {
 		remote.mu.Lock()
 		// r will be not nil if c.route.didSolicit was true
 		if r != nil {
+			// If we upgrade to solicited, we still want to keep the remote's
+			// connectURLs. So transfer those.
+			r.connectURLs = remote.route.connectURLs
 			remote.route = r
 		}
 		// This is to mitigate the issue where both sides add the route
@@ -565,60 +1213,134 @@ func (s *Server) addRoute(c *client, info *Info) (bool, bool) {
 	return !exists, sendInfo
 }
 
-func (s *Server) broadcastInterestToRoutes(proto string) {
-	var arg []byte
-	if atomic.LoadInt32(&s.logging.trace) == 1 {
-		arg = []byte(proto[:len(proto)-LEN_CR_LF])
+// updateRouteSubscriptionMap will make sure to update the route map for the subscription. Will
+// also forward to all routes if needed.
+func (s *Server) updateRouteSubscriptionMap(acc *Account, sub *subscription, delta int32) {
+	if acc == nil || sub == nil {
+		return
 	}
-	protoAsBytes := []byte(proto)
-	s.mu.Lock()
-	for _, route := range s.routes {
-		// FIXME(dlc) - Make same logic as deliverMsg
-		route.mu.Lock()
-		route.sendProto(protoAsBytes, true)
-		route.mu.Unlock()
-		route.traceOutOp("", arg)
+	acc.mu.RLock()
+	rm := acc.rm
+	acc.mu.RUnlock()
+
+	// This is non-nil when we know we are in cluster mode.
+	if rm == nil {
+		return
 	}
-	s.mu.Unlock()
+
+	// We only store state on local subs for transmission across routes.
+	if sub.client == nil || sub.client.typ != CLIENT {
+		return
+	}
+
+	// Create the fast key which will use the subject or 'subject<spc>queue' for queue subscribers.
+	var (
+		_rkey [1024]byte
+		key   []byte
+		qi    int
+	)
+	if sub.queue != nil {
+		// Just make the key subject spc group, e.g. 'foo bar'
+		key = _rkey[:0]
+		key = append(key, sub.subject...)
+		key = append(key, byte(' '))
+		qi = len(key)
+		key = append(key, sub.queue...)
+	} else {
+		key = sub.subject
+	}
+
+	// We always update for a queue subscriber since we need to send our relative weight.
+	var entry *rme
+	var ok bool
+
+	// Always update if a queue subscriber.
+	update := qi > 0
+
+	// Copy to hold outside acc lock.
+	var entryN int32
+
+	acc.mu.Lock()
+	if entry, ok = rm[string(key)]; ok {
+		entry.n += delta
+		if entry.n <= 0 {
+			delete(rm, string(key))
+			update = true // Update for deleting,
+		}
+	} else if delta > 0 {
+		entry = &rme{qi, delta}
+		rm[string(key)] = entry
+		update = true // Adding for normal sub means update.
+	}
+	if entry != nil {
+		entryN = entry.n
+	}
+	acc.mu.Unlock()
+
+	if !update || entry == nil {
+		return
+	}
+	// We need to send out this update.
+
+	// If we are sending a queue sub, copy and place in the queue weight.
+	if sub.queue != nil {
+		sub.client.mu.Lock()
+		nsub := *sub
+		sub.client.mu.Unlock()
+		nsub.qw = entryN
+		sub = &nsub
+	}
+
+	// Note that queue unsubs where entry.n > 0 are still
+	// subscribes with a smaller weight.
+	if entryN > 0 {
+		s.broadcastSubscribe(sub)
+	} else {
+		s.broadcastUnSubscribe(sub)
+	}
 }
 
 // broadcastSubscribe will forward a client subscription
-// to all active routes.
+// to all active routes as needed.
 func (s *Server) broadcastSubscribe(sub *subscription) {
-	if s.numRoutes() == 0 {
-		return
+	trace := atomic.LoadInt32(&s.logging.trace) == 1
+	s.mu.Lock()
+	subs := []*subscription{sub}
+	for _, route := range s.routes {
+		route.mu.Lock()
+		route.sendRouteSubProtos(subs, trace, func(sub *subscription) bool {
+			return route.canImport(string(sub.subject))
+		})
+		route.mu.Unlock()
 	}
-	rsid := routeSid(sub)
-	proto := fmt.Sprintf(subProto, sub.subject, sub.queue, rsid)
-	s.broadcastInterestToRoutes(proto)
+	s.mu.Unlock()
 }
 
 // broadcastUnSubscribe will forward a client unsubscribe
 // action to all active routes.
 func (s *Server) broadcastUnSubscribe(sub *subscription) {
-	if s.numRoutes() == 0 {
-		return
+	trace := atomic.LoadInt32(&s.logging.trace) == 1
+	s.mu.Lock()
+	subs := []*subscription{sub}
+	for _, route := range s.routes {
+		route.mu.Lock()
+		route.sendRouteUnSubProtos(subs, trace, func(sub *subscription) bool {
+			return route.canImport(string(sub.subject))
+		})
+		route.mu.Unlock()
 	}
-	rsid := routeSid(sub)
-	maxStr := _EMPTY_
-	sub.client.mu.Lock()
-	// Set max if we have it set and have not tripped auto-unsubscribe
-	if sub.max > 0 && sub.nm < sub.max {
-		maxStr = fmt.Sprintf(" %d", sub.max)
-	}
-	sub.client.mu.Unlock()
-	proto := fmt.Sprintf(unsubProto, rsid, maxStr)
-	s.broadcastInterestToRoutes(proto)
+	s.mu.Unlock()
 }
 
 func (s *Server) routeAcceptLoop(ch chan struct{}) {
+	defer func() {
+		if ch != nil {
+			close(ch)
+		}
+	}()
+
 	// Snapshot server options.
 	opts := s.getOpts()
-
-	// Get all possible URLs (when server listens to 0.0.0.0).
-	// This is going to be sent to other Servers, so that they can let their
-	// clients know about us.
-	clientConnectURLs := s.getClientConnectURLs()
 
 	// Snapshot server options.
 	port := opts.Cluster.Port
@@ -628,43 +1350,66 @@ func (s *Server) routeAcceptLoop(ch chan struct{}) {
 	}
 
 	hp := net.JoinHostPort(opts.Cluster.Host, strconv.Itoa(port))
-	s.Noticef("Listening for route connections on %s", hp)
 	l, e := net.Listen("tcp", hp)
 	if e != nil {
-		// We need to close this channel to avoid a deadlock
-		close(ch)
 		s.Fatalf("Error listening on router port: %d - %v", opts.Cluster.Port, e)
 		return
 	}
+	s.Noticef("Listening for route connections on %s",
+		net.JoinHostPort(opts.Cluster.Host, strconv.Itoa(l.Addr().(*net.TCPAddr).Port)))
 
+	s.mu.Lock()
+	// For tests, we want to be able to make this server behave
+	// as an older server so we use the variable which we can override.
+	proto := testRouteProto
 	// Check for TLSConfig
 	tlsReq := opts.Cluster.TLSConfig != nil
 	info := Info{
-		ID:                s.info.ID,
-		Version:           s.info.Version,
-		Host:              opts.Cluster.Host,
-		Port:              l.Addr().(*net.TCPAddr).Port,
-		AuthRequired:      false,
-		TLSRequired:       tlsReq,
-		SSLRequired:       tlsReq,
-		TLSVerify:         tlsReq,
-		MaxPayload:        s.info.MaxPayload,
-		ClientConnectURLs: clientConnectURLs,
+		ID:           s.info.ID,
+		Version:      s.info.Version,
+		GoVersion:    runtime.Version(),
+		AuthRequired: false,
+		TLSRequired:  tlsReq,
+		TLSVerify:    tlsReq,
+		MaxPayload:   s.info.MaxPayload,
+		Proto:        proto,
 	}
+	// Set this if only if advertise is not disabled
+	if !opts.Cluster.NoAdvertise {
+		info.ClientConnectURLs = s.clientConnectURLs
+	}
+	// If we have selected a random port...
+	if port == 0 {
+		// Write resolved port back to options.
+		opts.Cluster.Port = l.Addr().(*net.TCPAddr).Port
+	}
+	// Keep track of actual listen port. This will be needed in case of
+	// config reload.
+	s.clusterActualPort = opts.Cluster.Port
 	// Check for Auth items
 	if opts.Cluster.Username != "" {
 		info.AuthRequired = true
 	}
+	// Check for permissions.
+	if opts.Cluster.Permissions != nil {
+		info.Import = opts.Cluster.Permissions.Import
+		info.Export = opts.Cluster.Permissions.Export
+	}
 	s.routeInfo = info
-	s.generateRouteInfoJSON()
-
+	// Possibly override Host/Port and set IP based on Cluster.Advertise
+	if err := s.setRouteInfoHostPortAndIP(); err != nil {
+		s.Fatalf("Error setting route INFO with Cluster.Advertise value of %s, err=%v", s.opts.Cluster.Advertise, err)
+		l.Close()
+		s.mu.Unlock()
+		return
+	}
 	// Setup state that can enable shutdown
-	s.mu.Lock()
 	s.routeListener = l
 	s.mu.Unlock()
 
 	// Let them know we are up
 	close(ch)
+	ch = nil
 
 	tmpDelay := ACCEPT_MIN_SLEEP
 
@@ -692,6 +1437,26 @@ func (s *Server) routeAcceptLoop(ch chan struct{}) {
 	}
 	s.Debugf("Router accept loop exiting..")
 	s.done <- true
+}
+
+// Similar to setInfoHostPortAndGenerateJSON, but for routeInfo.
+func (s *Server) setRouteInfoHostPortAndIP() error {
+	if s.opts.Cluster.Advertise != "" {
+		advHost, advPort, err := parseHostPort(s.opts.Cluster.Advertise, s.opts.Cluster.Port)
+		if err != nil {
+			return err
+		}
+		s.routeInfo.Host = advHost
+		s.routeInfo.Port = advPort
+		s.routeInfo.IP = fmt.Sprintf("nats-route://%s/", net.JoinHostPort(advHost, strconv.Itoa(advPort)))
+	} else {
+		s.routeInfo.Host = s.opts.Cluster.Host
+		s.routeInfo.Port = s.opts.Cluster.Port
+		s.routeInfo.IP = ""
+	}
+	// (re)generate the routeInfoJSON byte array
+	s.generateRouteInfoJSON()
+	return nil
 }
 
 // StartRouting will start the accept loop on the cluster host:port
@@ -723,8 +1488,23 @@ func (s *Server) reConnectToRoute(rURL *url.URL, rtype RouteType) {
 	if tryForEver {
 		delay += DEFAULT_ROUTE_RECONNECT
 	}
-	time.Sleep(delay)
+	select {
+	case <-time.After(delay):
+	case <-s.quitCh:
+		s.grWG.Done()
+		return
+	}
 	s.connectToRoute(rURL, tryForEver)
+}
+
+// Checks to make sure the route is still valid.
+func (s *Server) routeStillValid(rURL *url.URL) bool {
+	for _, ri := range s.getOpts().Routes {
+		if urlsAreEqual(ri, rURL) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) connectToRoute(rURL *url.URL, tryForEver bool) {
@@ -732,8 +1512,12 @@ func (s *Server) connectToRoute(rURL *url.URL, tryForEver bool) {
 	opts := s.getOpts()
 
 	defer s.grWG.Done()
+
 	attempts := 0
 	for s.isRunning() && rURL != nil {
+		if tryForEver && !s.routeStillValid(rURL) {
+			return
+		}
 		s.Debugf("Trying to connect to route on %s", rURL.Host)
 		conn, err := net.DialTimeout("tcp", rURL.Host, DEFAULT_ROUTE_DIAL)
 		if err != nil {
@@ -748,12 +1532,18 @@ func (s *Server) connectToRoute(rURL *url.URL, tryForEver bool) {
 				}
 			}
 			select {
-			case <-s.rcQuit:
+			case <-s.quitCh:
 				return
 			case <-time.After(DEFAULT_ROUTE_CONNECT):
 				continue
 			}
 		}
+
+		if tryForEver && !s.routeStillValid(rURL) {
+			conn.Close()
+			return
+		}
+
 		// We have a route connection here.
 		// Go ahead and create it and exit this func.
 		s.createRoute(conn, rURL)
@@ -772,10 +1562,4 @@ func (s *Server) solicitRoutes(routes []*url.URL) {
 		route := r
 		s.startGoRoutine(func() { s.connectToRoute(route, true) })
 	}
-}
-
-func (s *Server) numRoutes() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.routes)
 }

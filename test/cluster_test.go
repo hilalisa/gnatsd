@@ -1,4 +1,15 @@
-// Copyright 2013-2016 Apcera Inc. All rights reserved.
+// Copyright 2013-2018 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package test
 
@@ -14,34 +25,33 @@ import (
 
 // Helper function to check that a cluster is formed
 func checkClusterFormed(t *testing.T, servers ...*server.Server) {
-	// Wait for the cluster to form
-	var err string
+	t.Helper()
 	expectedNumRoutes := len(servers) - 1
-	maxTime := time.Now().Add(5 * time.Second)
-	for time.Now().Before(maxTime) {
-		err = ""
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
 		for _, s := range servers {
 			if numRoutes := s.NumRoutes(); numRoutes != expectedNumRoutes {
-				err = fmt.Sprintf("Expected %d routes for server %q, got %d", expectedNumRoutes, s.ID(), numRoutes)
-				break
+				return fmt.Errorf("Expected %d routes for server %q, got %d", expectedNumRoutes, s.ID(), numRoutes)
 			}
 		}
-		if err != "" {
-			time.Sleep(100 * time.Millisecond)
-		} else {
-			break
+		return nil
+	})
+}
+
+func checkNumRoutes(t *testing.T, s *server.Server, expected int) {
+	t.Helper()
+	checkFor(t, 5*time.Second, 15*time.Millisecond, func() error {
+		if nr := s.NumRoutes(); nr != expected {
+			return fmt.Errorf("Expected %v routes, got %v", expected, nr)
 		}
-	}
-	if err != "" {
-		t.Fatalf("%s", err)
-	}
+		return nil
+	})
 }
 
 // Helper function to check that a server (or list of servers) have the
-// expected number of subscriptions
+// expected number of subscriptions.
 func checkExpectedSubs(expected int, servers ...*server.Server) error {
 	var err string
-	maxTime := time.Now().Add(5 * time.Second)
+	maxTime := time.Now().Add(10 * time.Second)
 	for time.Now().Before(maxTime) {
 		err = ""
 		for _, s := range servers {
@@ -51,7 +61,7 @@ func checkExpectedSubs(expected int, servers ...*server.Server) error {
 			}
 		}
 		if err != "" {
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 		} else {
 			break
 		}
@@ -60,6 +70,15 @@ func checkExpectedSubs(expected int, servers ...*server.Server) error {
 		return errors.New(err)
 	}
 	return nil
+}
+
+func runThreeServers(t *testing.T) (srvA, srvB, srvC *server.Server, optsA, optsB, optsC *server.Options) {
+	srvA, optsA = RunServerWithConfig("./configs/srv_a.conf")
+	srvB, optsB = RunServerWithConfig("./configs/srv_b.conf")
+	srvC, optsC = RunServerWithConfig("./configs/srv_c.conf")
+
+	checkClusterFormed(t, srvA, srvB, srvC)
+	return
 }
 
 func runServers(t *testing.T) (srvA, srvB *server.Server, optsA, optsB *server.Options) {
@@ -151,7 +170,8 @@ func TestClusterQueueSubs(t *testing.T) {
 	expectA(pongRe)
 
 	// Make sure the subs have propagated to srvB before continuing
-	if err := checkExpectedSubs(len(qg1SidsA), srvB); err != nil {
+	// New cluster proto this will only be 1.
+	if err := checkExpectedSubs(1, srvB); err != nil {
 		t.Fatalf("%v", err)
 	}
 
@@ -178,7 +198,8 @@ func TestClusterQueueSubs(t *testing.T) {
 	expectA(pongRe)
 
 	// Make sure the subs have propagated to srvB before continuing
-	if err := checkExpectedSubs(len(qg1SidsA)+len(pSids), srvB); err != nil {
+	// Normal foo and the queue group will be one a piece, so 2 + wc == 3
+	if err := checkExpectedSubs(3, srvB); err != nil {
 		t.Fatalf("%v", err)
 	}
 
@@ -209,7 +230,8 @@ func TestClusterQueueSubs(t *testing.T) {
 	expectB(pongRe)
 
 	// Make sure the subs have propagated to srvA before continuing
-	if err := checkExpectedSubs(len(qg1SidsA)+len(pSids)+len(qg2SidsB), srvA); err != nil {
+	// This will be all the subs on A and just 1 from B that gets coalesced.
+	if err := checkExpectedSubs(len(qg1SidsA)+len(pSids)+1, srvA); err != nil {
 		t.Fatalf("%v", err)
 	}
 
@@ -233,7 +255,7 @@ func TestClusterQueueSubs(t *testing.T) {
 	expectA(pongRe)
 
 	// Make sure the subs have propagated to srvB before continuing
-	if err := checkExpectedSubs(len(pSids)+len(qg2SidsB), srvB); err != nil {
+	if err := checkExpectedSubs(1+1+len(qg2SidsB), srvB); err != nil {
 		t.Fatalf("%v", err)
 	}
 
@@ -292,7 +314,7 @@ func TestClusterDoubleMsgs(t *testing.T) {
 	expectA1(pongRe)
 
 	// Make sure the subs have propagated to srvB before continuing
-	if err := checkExpectedSubs(len(qg1SidsA), srvB); err != nil {
+	if err := checkExpectedSubs(1, srvB); err != nil {
 		t.Fatalf("%v", err)
 	}
 
@@ -313,7 +335,7 @@ func TestClusterDoubleMsgs(t *testing.T) {
 	pSids := []string{"1", "2"}
 
 	// Make sure the subs have propagated to srvB before continuing
-	if err := checkExpectedSubs(len(qg1SidsA)+2, srvB); err != nil {
+	if err := checkExpectedSubs(1+2, srvB); err != nil {
 		t.Fatalf("%v", err)
 	}
 
@@ -436,6 +458,8 @@ func TestAutoUnsubscribePropagation(t *testing.T) {
 
 	sendA("PING\r\n")
 	expectA(pongRe)
+
+	time.Sleep(50 * time.Millisecond)
 
 	// Make sure number of subscriptions on B is correct
 	if subs := srvB.NumSubscriptions(); subs != 0 {

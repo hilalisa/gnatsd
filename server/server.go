@@ -1,95 +1,147 @@
-// Copyright 2012-2016 Apcera Inc. All rights reserved.
+// Copyright 2012-2018 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package server
 
 import (
-	"bufio"
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// Allow dynamic profiling.
 	_ "net/http/pprof"
 
-	"github.com/nats-io/gnatsd/util"
+	"github.com/nats-io/gnatsd/logger"
 )
+
+// Time to wait before starting closing clients when in LD mode.
+const lameDuckModeDefaultInitialDelay = int64(time.Second)
+
+// Make this a variable so that we can change during tests
+var lameDuckModeInitialDelay = int64(lameDuckModeDefaultInitialDelay)
 
 // Info is the information sent to clients to help them understand information
 // about this server.
 type Info struct {
 	ID                string   `json:"server_id"`
 	Version           string   `json:"version"`
+	Proto             int      `json:"proto"`
+	GitCommit         string   `json:"git_commit,omitempty"`
 	GoVersion         string   `json:"go"`
 	Host              string   `json:"host"`
 	Port              int      `json:"port"`
-	AuthRequired      bool     `json:"auth_required"`
-	SSLRequired       bool     `json:"ssl_required"` // DEPRECATED: ssl json used for older clients
-	TLSRequired       bool     `json:"tls_required"`
-	TLSVerify         bool     `json:"tls_verify"`
+	AuthRequired      bool     `json:"auth_required,omitempty"`
+	TLSRequired       bool     `json:"tls_required,omitempty"`
+	TLSVerify         bool     `json:"tls_verify,omitempty"`
 	MaxPayload        int      `json:"max_payload"`
 	IP                string   `json:"ip,omitempty"`
+	CID               uint64   `json:"client_id,omitempty"`
+	Nonce             string   `json:"nonce,omitempty"`
 	ClientConnectURLs []string `json:"connect_urls,omitempty"` // Contains URLs a client can connect to.
 
-	// Used internally for quick look-ups.
-	clientConnectURLs map[string]struct{}
+	// Route Specific
+	Import *SubjectPermission `json:"import,omitempty"`
+	Export *SubjectPermission `json:"export,omitempty"`
 }
 
 // Server is our main struct.
 type Server struct {
 	gcid uint64
 	stats
-	mu            sync.Mutex
-	info          Info
-	infoJSON      []byte
-	sl            *Sublist
-	configFile    string
-	optsMu        sync.RWMutex
-	opts          *Options
-	running       bool
-	shutdown      bool
-	listener      net.Listener
-	clients       map[uint64]*client
-	routes        map[uint64]*client
-	remotes       map[string]*client
-	users         map[string]*User
-	totalClients  uint64
-	done          chan bool
-	start         time.Time
-	http          net.Listener
-	httpHandler   http.Handler
-	profiler      net.Listener
-	httpReqStats  map[string]uint64
-	routeListener net.Listener
-	routeInfo     Info
-	routeInfoJSON []byte
-	rcQuit        chan bool
-	grMu          sync.Mutex
-	grTmpClients  map[uint64]*client
-	grRunning     bool
-	grWG          sync.WaitGroup // to wait on various go routines
-	cproto        int64          // number of clients supporting async INFO
-	configTime    time.Time      // last time config was loaded
-	logging       struct {
+	mu             sync.Mutex
+	prand          *rand.Rand
+	info           Info
+	configFile     string
+	optsMu         sync.RWMutex
+	opts           *Options
+	running        bool
+	shutdown       bool
+	listener       net.Listener
+	gacc           *Account
+	accounts       map[string]*Account
+	activeAccounts int
+	clients        map[uint64]*client
+	routes         map[uint64]*client
+	remotes        map[string]*client
+	users          map[string]*User
+	nkeys          map[string]*NkeyUser
+	totalClients   uint64
+	closed         *closedRingBuffer
+	done           chan bool
+	start          time.Time
+	http           net.Listener
+	httpHandler    http.Handler
+	profiler       net.Listener
+	httpReqStats   map[string]uint64
+	routeListener  net.Listener
+	routeInfo      Info
+	routeInfoJSON  []byte
+	quitCh         chan struct{}
+
+	// Tracking Go routines
+	grMu         sync.Mutex
+	grTmpClients map[uint64]*client
+	grRunning    bool
+	grWG         sync.WaitGroup // to wait on various go routines
+
+	cproto     int64     // number of clients supporting async INFO
+	configTime time.Time // last time config was loaded
+
+	logging struct {
 		sync.RWMutex
 		logger Logger
 		trace  int32
 		debug  int32
 	}
 
+	clientConnectURLs []string
+
+	// Used internally for quick look-ups.
+	clientConnectURLsMap map[string]struct{}
+
+	lastCURLsUpdate int64
+
+	// These store the real client/cluster listen ports. They are
+	// required during config reload to reset the Options (after
+	// reload) to the actual listen port values.
+	clientActualPort  int
+	clusterActualPort int
+
+	// Use during reload
+	oldClusterPerms *RoutePermissions
+
 	// Used by tests to check that http.Servers do
 	// not set any timeout.
 	monitoringServer *http.Server
 	profilingServer  *http.Server
+
+	// LameDuck mode
+	ldm   bool
+	ldmCh chan bool
 }
 
 // Make sure all are 64bits for atomic use
@@ -110,24 +162,24 @@ func New(opts *Options) *Server {
 	verify := (tlsReq && opts.TLSConfig.ClientAuth == tls.RequireAndVerifyClientCert)
 
 	info := Info{
-		ID:                genID(),
-		Version:           VERSION,
-		GoVersion:         runtime.Version(),
-		Host:              opts.Host,
-		Port:              opts.Port,
-		AuthRequired:      false,
-		TLSRequired:       tlsReq,
-		SSLRequired:       tlsReq,
-		TLSVerify:         verify,
-		MaxPayload:        opts.MaxPayload,
-		clientConnectURLs: make(map[string]struct{}),
+		ID:           genID(),
+		Version:      VERSION,
+		Proto:        PROTO,
+		GitCommit:    gitCommit,
+		GoVersion:    runtime.Version(),
+		Host:         opts.Host,
+		Port:         opts.Port,
+		AuthRequired: false,
+		TLSRequired:  tlsReq,
+		TLSVerify:    verify,
+		MaxPayload:   opts.MaxPayload,
 	}
 
 	now := time.Now()
 	s := &Server{
 		configFile: opts.ConfigFile,
 		info:       info,
-		sl:         NewSublist(),
+		prand:      rand.New(rand.NewSource(time.Now().UnixNano())),
 		opts:       opts,
 		done:       make(chan bool, 1),
 		start:      now,
@@ -137,8 +189,27 @@ func New(opts *Options) *Server {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// This is normally done in the AcceptLoop, once the
+	// listener has been created (possibly with random port),
+	// but since some tests may expect the INFO to be properly
+	// set after New(), let's do it now.
+	s.setInfoHostPortAndGenerateJSON()
+
+	// Used internally for quick look-ups.
+	s.clientConnectURLsMap = make(map[string]struct{})
+
+	// For tracking accounts
+	s.accounts = make(map[string]*Account)
+
+	// Create global account.
+	s.gacc = &Account{Name: globalAccountName}
+	s.registerAccount(s.gacc)
+
 	// For tracking clients
 	s.clients = make(map[uint64]*client)
+
+	// For tracking closed clients.
+	s.closed = newClosedRingBuffer(opts.MaxClosedClients)
 
 	// For tracking connections that are not yet registered
 	// in s.routes, but for which readLoop has started.
@@ -148,14 +219,17 @@ func New(opts *Options) *Server {
 	s.routes = make(map[uint64]*client)
 	s.remotes = make(map[string]*client)
 
-	// Used to kick out all of the route
-	// connect Go routines.
-	s.rcQuit = make(chan bool)
+	// Used to kick out all go routines possibly waiting on server
+	// to shutdown.
+	s.quitCh = make(chan struct{})
+
+	// Used to setup Accounts.
+	s.configureAccounts()
 
 	// Used to setup Authorization.
 	s.configureAuthorization()
 
-	s.generateServerInfoJSON()
+	// Start signal handler
 	s.handleSignals()
 
 	return s
@@ -174,23 +248,22 @@ func (s *Server) setOpts(opts *Options) {
 	s.optsMu.Unlock()
 }
 
-func (s *Server) generateServerInfoJSON() {
-	// Generate the info json
-	b, err := json.Marshal(s.info)
-	if err != nil {
-		s.Fatalf("Error marshaling INFO JSON: %+v\n", err)
-		return
+func (s *Server) configureAccounts() {
+	// Check opts and walk through them. Making sure to create SLs.
+	for _, acc := range s.opts.Accounts {
+		s.registerAccount(acc)
 	}
-	s.infoJSON = []byte(fmt.Sprintf("INFO %s %s", b, CR_LF))
 }
 
 func (s *Server) generateRouteInfoJSON() {
-	b, err := json.Marshal(s.routeInfo)
-	if err != nil {
-		s.Fatalf("Error marshaling route INFO JSON: %+v\n", err)
-		return
-	}
-	s.routeInfoJSON = []byte(fmt.Sprintf(InfoProto, b))
+	// New proto wants a nonce.
+	var raw [nonceLen]byte
+	nonce := raw[:]
+	s.generateNonce(nonce)
+	s.routeInfo.Nonce = string(nonce)
+	b, _ := json.Marshal(s.routeInfo)
+	pcs := [][]byte{[]byte("INFO"), b, []byte(CR_LF)}
+	s.routeInfoJSON = bytes.Join(pcs, []byte(" "))
 }
 
 // PrintAndDie is exported for access in other packages.
@@ -236,11 +309,100 @@ func (s *Server) logPid() error {
 	return ioutil.WriteFile(s.getOpts().PidFile, []byte(pidStr), 0660)
 }
 
+// NewAccountsAllowed returns whether or not new accounts can be created on the fly.
+func (s *Server) NewAccountsAllowed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.opts.AllowNewAccounts
+}
+
+// numReservedAccounts will return the number of reserved accounts configured in the server.
+// Currently this is 1 for the global default service.
+func (s *Server) numReservedAccounts() int {
+	return 1
+}
+
+// NumActiveAccounts reports number of active accounts on this server.
+func (s *Server) NumActiveAccounts() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.activeAccounts
+}
+
+// LookupOrRegisterAccount will return the given account if known or create a new entry.
+func (s *Server) LookupOrRegisterAccount(name string) (account *Account, isNew bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if acc, ok := s.accounts[name]; ok {
+		return acc, false
+	}
+	acc := &Account{
+		Name: name,
+		sl:   NewSublist(),
+	}
+	s.registerAccount(acc)
+	return acc, true
+}
+
+// RegisterAccount will register an account. The account must be new
+// or this call will fail.
+func (s *Server) RegisterAccount(name string) (*Account, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.accounts[name]; ok {
+		return nil, ErrAccountExists
+	}
+	acc := &Account{Name: name}
+	s.registerAccount(acc)
+	return acc, nil
+}
+
+// Place common account setup here.
+func (s *Server) registerAccount(acc *Account) {
+	if acc.sl == nil {
+		acc.sl = NewSublist()
+	}
+	if acc.maxnae == 0 {
+		acc.maxnae = DEFAULT_MAX_ACCOUNT_AE_RESPONSE_MAPS
+	}
+	if acc.maxaettl == 0 {
+		acc.maxaettl = DEFAULT_TTL_AE_RESPONSE_MAP
+	}
+	// If we are capable of routing we will track subscription
+	// information for efficient interest propagation.
+	// During config reload, it is possible that account was
+	// already created (global account), so use locking and
+	// make sure we create only if needed.
+	acc.mu.Lock()
+	if acc.rm == nil && s.opts != nil && s.opts.Cluster.Port != 0 {
+		acc.rm = make(map[string]*rme, 256)
+	}
+	acc.mu.Unlock()
+	s.accounts[acc.Name] = acc
+}
+
+// LookupAccount is a public function to return the account structure
+// associated with name.
+func (s *Server) LookupAccount(name string) *Account {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.accounts[name]
+}
+
 // Start up the server, this will block.
 // Start via a Go routine if needed.
 func (s *Server) Start() {
 	s.Noticef("Starting nats-server version %s", VERSION)
 	s.Debugf("Go build version %s", s.info.GoVersion)
+	gc := gitCommit
+	if gc == "" {
+		gc = "not set"
+	}
+	s.Noticef("Git commit [%s]", gc)
+
+	// Check for insecure configurations.op
+	s.checkAuthforWarnings()
 
 	// Avoid RACE between Start() and Shutdown()
 	s.mu.Lock()
@@ -283,6 +445,10 @@ func (s *Server) Start() {
 		s.StartProfiler()
 	}
 
+	if opts.PortsFileDir != _EMPTY_ {
+		s.logPorts()
+	}
+
 	// Wait for clients.
 	s.AcceptLoop(clientListenReady)
 }
@@ -291,12 +457,15 @@ func (s *Server) Start() {
 // and closing all associated clients.
 func (s *Server) Shutdown() {
 	s.mu.Lock()
-
 	// Prevent issues with multiple calls.
 	if s.shutdown {
 		s.mu.Unlock()
 		return
 	}
+	s.Noticef("Server Exiting..")
+
+	opts := s.getOpts()
+
 	s.shutdown = true
 	s.running = false
 	s.grMu.Lock()
@@ -352,14 +521,14 @@ func (s *Server) Shutdown() {
 		s.profiler.Close()
 	}
 
-	// Release the solicited routes connect go routines.
-	close(s.rcQuit)
-
 	s.mu.Unlock()
+
+	// Release go routines that wait on that channel
+	close(s.quitCh)
 
 	// Close client and route connections
 	for _, c := range conns {
-		c.closeConnection()
+		c.closeConnection(ServerShutdown)
 	}
 
 	// Block until the accept loops exit
@@ -370,6 +539,21 @@ func (s *Server) Shutdown() {
 
 	// Wait for go routines to be done.
 	s.grWG.Wait()
+
+	if opts.PortsFileDir != _EMPTY_ {
+		s.deletePortsFile(opts.PortsFileDir)
+	}
+
+	// Close logger if applicable. It allows tests on Windows
+	// to be able to do proper cleanup (delete log file).
+	s.logging.RLock()
+	log := s.logging.logger
+	s.logging.RUnlock()
+	if log != nil {
+		if l, ok := log.(*logger.Logger); ok {
+			l.Close()
+		}
+	}
 }
 
 // AcceptLoop is exported for easier testing.
@@ -410,20 +594,22 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 	// to 0 at the beginning this function. So we need to get the actual port
 	if opts.Port == 0 {
 		// Write resolved port back to options.
-		_, port, err := net.SplitHostPort(l.Addr().String())
-		if err != nil {
-			s.Fatalf("Error parsing server address (%s): %s", l.Addr().String(), e)
-			s.mu.Unlock()
-			return
-		}
-		portNum, err := strconv.Atoi(port)
-		if err != nil {
-			s.Fatalf("Error parsing server address (%s): %s", l.Addr().String(), e)
-			s.mu.Unlock()
-			return
-		}
-		opts.Port = portNum
+		opts.Port = l.Addr().(*net.TCPAddr).Port
 	}
+	// Keep track of actual listen port. This will be needed in case of
+	// config reload.
+	s.clientActualPort = opts.Port
+
+	// Now that port has been set (if it was set to RANDOM), set the
+	// server's info Host/Port with either values from Options or
+	// ClientAdvertise. Also generate the JSON byte array.
+	if err := s.setInfoHostPortAndGenerateJSON(); err != nil {
+		s.Fatalf("Error setting server INFO with ClientAdvertise value of %s, err=%v", s.opts.ClientAdvertise, err)
+		s.mu.Unlock()
+		return
+	}
+	// Keep track of client connect URLs. We may need them later.
+	s.clientConnectURLs = s.getClientConnectURLs()
 	s.mu.Unlock()
 
 	// Let the caller know that we are ready
@@ -435,6 +621,13 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 	for s.isRunning() {
 		conn, err := l.Accept()
 		if err != nil {
+			if s.isLameDuckMode() {
+				// Signal that we are not accepting new clients
+				s.ldmCh <- true
+				// Now wait for the Shutdown...
+				<-s.quitCh
+				return
+			}
 			if ne, ok := err.(net.Error); ok && ne.Temporary() {
 				s.Errorf("Temporary Client Accept Error (%v), sleeping %dms",
 					ne, tmpDelay/time.Millisecond)
@@ -454,8 +647,30 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 			s.grWG.Done()
 		})
 	}
-	s.Noticef("Server Exiting..")
 	s.done <- true
+}
+
+// This function sets the server's info Host/Port based on server Options.
+// Note that this function may be called during config reload, this is why
+// Host/Port may be reset to original Options if the ClientAdvertise option
+// is not set (since it may have previously been).
+// The function then generates the server infoJSON.
+func (s *Server) setInfoHostPortAndGenerateJSON() error {
+	// When this function is called, opts.Port is set to the actual listen
+	// port (if option was originally set to RANDOM), even during a config
+	// reload. So use of s.opts.Port is safe.
+	if s.opts.ClientAdvertise != "" {
+		h, p, err := parseHostPort(s.opts.ClientAdvertise, s.opts.Port)
+		if err != nil {
+			return err
+		}
+		s.info.Host = h
+		s.info.Port = p
+	} else {
+		s.info.Host = s.opts.Host
+		s.info.Port = s.opts.Port
+	}
+	return nil
 }
 
 // StartProfiler is called to enable dynamic profiling.
@@ -578,7 +793,7 @@ func (s *Server) startMonitoring(secure bool) error {
 			port = 0
 		}
 		hp = net.JoinHostPort(opts.HTTPHost, strconv.Itoa(port))
-		config := util.CloneTLSConfig(opts.TLSConfig)
+		config := opts.TLSConfig.Clone()
 		config.ClientAuth = tls.NoClientCert
 		httpListener, err = tls.Listen("tcp", hp, config)
 
@@ -650,17 +865,41 @@ func (s *Server) HTTPHandler() http.Handler {
 	return s.httpHandler
 }
 
+// Perform a conditional deep copy due to reference nature of ClientConnectURLs.
+// If updates are made to Info, this function should be consulted and updated.
+// Assume lock is held.
+func (s *Server) copyInfo() Info {
+	info := s.info
+	if info.ClientConnectURLs != nil {
+		info.ClientConnectURLs = make([]string, len(s.info.ClientConnectURLs))
+		copy(info.ClientConnectURLs, s.info.ClientConnectURLs)
+	}
+	if s.nonceRequired() {
+		// Nonce handling
+		var raw [nonceLen]byte
+		nonce := raw[:]
+		s.generateNonce(nonce)
+		info.Nonce = string(nonce)
+	}
+	return info
+}
+
 func (s *Server) createClient(conn net.Conn) *client {
 	// Snapshot server options.
 	opts := s.getOpts()
 
-	c := &client{srv: s, nc: conn, opts: defaultOpts, mpay: int64(opts.MaxPayload), start: time.Now()}
+	maxPay := int64(opts.MaxPayload)
+	maxSubs := opts.MaxSubs
+	now := time.Now()
+
+	c := &client{srv: s, nc: conn, opts: defaultOpts, mpay: maxPay, msubs: maxSubs, start: now, last: now}
+
+	c.registerWithAccount(s.gacc)
 
 	// Grab JSON info string
 	s.mu.Lock()
-	info := s.infoJSON
-	authRequired := s.info.AuthRequired
-	tlsRequired := s.info.TLSRequired
+	info := s.copyInfo()
+	c.nonce = []byte(info.Nonce)
 	s.totalClients++
 	s.mu.Unlock()
 
@@ -673,7 +912,7 @@ func (s *Server) createClient(conn net.Conn) *client {
 	c.Debugf("Client connection created")
 
 	// Send our information.
-	c.sendInfo(info)
+	c.sendInfo(c.generateClientInfoJSON(info))
 
 	// Unlock to register
 	c.mu.Unlock()
@@ -683,8 +922,8 @@ func (s *Server) createClient(conn net.Conn) *client {
 	// If server is not running, Shutdown() may have already gathered the
 	// list of connections to close. It won't contain this one, so we need
 	// to bail out now otherwise the readLoop started down there would not
-	// be interrupted.
-	if !s.running {
+	// be interrupted. Skip also if in lame duck mode.
+	if !s.running || s.ldm {
 		s.mu.Unlock()
 		return c
 	}
@@ -703,7 +942,7 @@ func (s *Server) createClient(conn net.Conn) *client {
 	c.mu.Lock()
 
 	// Check for TLS
-	if tlsRequired {
+	if info.TLSRequired {
 		c.Debugf("Starting TLS client connection handshake")
 		c.nc = tls.Server(c.nc, opts.TLSConfig)
 		conn := c.nc.(*tls.Conn)
@@ -716,9 +955,8 @@ func (s *Server) createClient(conn net.Conn) *client {
 		// Force handshake
 		c.mu.Unlock()
 		if err := conn.Handshake(); err != nil {
-			c.Debugf("TLS handshake error: %v", err)
-			c.sendErr("Secure Connection - TLS Required")
-			c.closeConnection()
+			c.Errorf("TLS handshake error: %v", err)
+			c.closeConnection(TLSHandshakeError)
 			return nil
 		}
 		// Reset the read deadline
@@ -740,13 +978,8 @@ func (s *Server) createClient(conn net.Conn) *client {
 	// Check for Auth. We schedule this timer after the TLS handshake to avoid
 	// the race where the timer fires during the handshake and causes the
 	// server to write bad data to the socket. See issue #432.
-	if authRequired {
+	if info.AuthRequired {
 		c.setAuthTimer(secondsToDuration(opts.AuthTimeout))
-	}
-
-	if tlsRequired {
-		// Rewrap bw
-		c.bw = bufio.NewWriterSize(c.nc, startBufSize)
 	}
 
 	// Do final client initialization
@@ -755,9 +988,12 @@ func (s *Server) createClient(conn net.Conn) *client {
 	c.setPingTimer()
 
 	// Spin up the read loop.
-	s.startGoRoutine(func() { c.readLoop() })
+	s.startGoRoutine(c.readLoop)
 
-	if tlsRequired {
+	// Spin up the write loop.
+	s.startGoRoutine(c.writeLoop)
+
+	if info.TLSRequired {
 		c.Debugf("TLS handshake complete")
 		cs := c.nc.(*tls.Conn).ConnectionState()
 		c.Debugf("TLS version %s, cipher suite %s", tlsVersion(cs.Version), tlsCipher(cs.CipherSuite))
@@ -768,25 +1004,88 @@ func (s *Server) createClient(conn net.Conn) *client {
 	return c
 }
 
-// updateServerINFO updates the server's Info object with the given
-// array of URLs and re-generate the infoJSON byte array, only if the
-// given URLs were not already recorded.
-func (s *Server) updateServerINFO(urls []string) {
+// This will save off a closed client in a ring buffer such that
+// /connz can inspect. Useful for debugging, etc.
+func (s *Server) saveClosedClient(c *client, nc net.Conn, reason ClosedState) {
+	now := time.Now()
+
+	c.mu.Lock()
+
+	cc := &closedClient{}
+	cc.fill(c, nc, now)
+	cc.Stop = &now
+	cc.Reason = reason.String()
+
+	// Do subs, do not place by default in main ConnInfo
+	if len(c.subs) > 0 {
+		cc.subs = make([]string, 0, len(c.subs))
+		for _, sub := range c.subs {
+			cc.subs = append(cc.subs, string(sub.subject))
+		}
+	}
+	// Hold user as well.
+	cc.user = c.opts.Username
+	c.mu.Unlock()
+
+	// Place in the ring buffer
+	s.mu.Lock()
+	if s.closed != nil {
+		s.closed.append(cc)
+	}
+	s.mu.Unlock()
+}
+
+// Adds the given array of urls to the server's INFO.ClientConnectURLs
+// array. The server INFO JSON is regenerated.
+// Note that a check is made to ensure that given URLs are not
+// already present. So the INFO JSON is regenerated only if new ULRs
+// were added.
+// If there was a change, an INFO protocol is sent to registered clients
+// that support async INFO protocols.
+func (s *Server) addClientConnectURLsAndSendINFOToClients(urls []string) {
+	s.updateServerINFOAndSendINFOToClients(urls, true)
+}
+
+// Removes the given array of urls from the server's INFO.ClientConnectURLs
+// array. The server INFO JSON is regenerated if needed.
+// If there was a change, an INFO protocol is sent to registered clients
+// that support async INFO protocols.
+func (s *Server) removeClientConnectURLsAndSendINFOToClients(urls []string) {
+	s.updateServerINFOAndSendINFOToClients(urls, false)
+}
+
+// Updates the server's Info object with the given array of URLs and re-generate
+// the infoJSON byte array, then send an (async) INFO protocol to clients that
+// support it.
+func (s *Server) updateServerINFOAndSendINFOToClients(urls []string, add bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	// Will be set to true if we alter the server's Info object.
 	wasUpdated := false
+	remove := !add
 	for _, url := range urls {
-		if _, present := s.info.clientConnectURLs[url]; !present {
-
-			s.info.clientConnectURLs[url] = struct{}{}
-			s.info.ClientConnectURLs = append(s.info.ClientConnectURLs, url)
+		_, present := s.clientConnectURLsMap[url]
+		if add && !present {
+			s.clientConnectURLsMap[url] = struct{}{}
+			wasUpdated = true
+		} else if remove && present {
+			delete(s.clientConnectURLsMap, url)
 			wasUpdated = true
 		}
 	}
 	if wasUpdated {
-		s.generateServerInfoJSON()
+		// Recreate the info.ClientConnectURL array from the map
+		s.info.ClientConnectURLs = s.info.ClientConnectURLs[:0]
+		// Add this server client connect ULRs first...
+		s.info.ClientConnectURLs = append(s.info.ClientConnectURLs, s.clientConnectURLs...)
+		for url := range s.clientConnectURLsMap {
+			s.info.ClientConnectURLs = append(s.info.ClientConnectURLs, url)
+		}
+		// Update the time of this update
+		s.lastCURLsUpdate = time.Now().UnixNano()
+		// Send to all registered clients that support async INFO protocols.
+		s.sendAsyncInfoToClients()
 	}
 }
 
@@ -801,9 +1100,9 @@ func tlsTimeout(c *client, conn *tls.Conn) {
 	}
 	cs := conn.ConnectionState()
 	if !cs.HandshakeComplete {
-		c.Debugf("TLS handshake timeout")
+		c.Errorf("TLS handshake timeout")
 		c.sendErr("Secure Connection - TLS Required")
-		c.closeConnection()
+		c.closeConnection(TLSHandshakeError)
 	}
 }
 
@@ -861,6 +1160,10 @@ func (s *Server) removeClient(c *client) {
 				delete(s.remotes, rID)
 			}
 		}
+		// Remove from temporary map in case it is there.
+		s.grMu.Lock()
+		delete(s.grTmpClients, cid)
+		s.grMu.Unlock()
 	}
 	s.mu.Unlock()
 }
@@ -872,8 +1175,9 @@ func (s *Server) removeClient(c *client) {
 // NumRoutes will report the number of registered routes.
 func (s *Server) NumRoutes() int {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.routes)
+	nr := len(s.routes)
+	s.mu.Unlock()
+	return nr
 }
 
 // NumRemotes will report number of registered remotes.
@@ -890,12 +1194,29 @@ func (s *Server) NumClients() int {
 	return len(s.clients)
 }
 
+// getClient will return the client associated with cid.
+func (s *Server) getClient(cid uint64) *client {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.clients[cid]
+}
+
 // NumSubscriptions will report how many subscriptions are active.
 func (s *Server) NumSubscriptions() uint32 {
 	s.mu.Lock()
-	subs := s.sl.Count()
+	var subs int
+	for _, acc := range s.accounts {
+		if acc.sl != nil {
+			subs += acc.TotalSubs()
+		}
+	}
 	s.mu.Unlock()
-	return subs
+	return uint32(subs)
+}
+
+// NumSlowConsumers will report the number of slow consumers.
+func (s *Server) NumSlowConsumers() int64 {
+	return atomic.LoadInt64(&s.slowConsumers)
 }
 
 // ConfigTime will report the last time the server configuration was loaded.
@@ -981,23 +1302,89 @@ func (s *Server) startGoRoutine(f func()) {
 	s.grMu.Unlock()
 }
 
+func (s *Server) numClosedConns() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed.len()
+}
+
+func (s *Server) totalClosedConns() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed.totalConns()
+}
+
+func (s *Server) closedClients() []*closedClient {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed.closedClients()
+}
+
 // getClientConnectURLs returns suitable URLs for clients to connect to the listen
 // port based on the server options' Host and Port. If the Host corresponds to
 // "any" interfaces, this call returns the list of resolved IP addresses.
+// If ClientAdvertise is set, returns the client advertise host and port.
+// The server lock is assumed held on entry.
 func (s *Server) getClientConnectURLs() []string {
 	// Snapshot server options.
 	opts := s.getOpts()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	sPort := strconv.Itoa(opts.Port)
 	urls := make([]string, 0, 1)
 
-	ipAddr, err := net.ResolveIPAddr("ip", opts.Host)
-	// If the host is "any" (0.0.0.0 or ::), get specific IPs from available
-	// interfaces.
-	if err == nil && ipAddr.IP.IsUnspecified() {
+	// short circuit if client advertise is set
+	if opts.ClientAdvertise != "" {
+		// just use the info host/port. This is updated in s.New()
+		urls = append(urls, net.JoinHostPort(s.info.Host, strconv.Itoa(s.info.Port)))
+	} else {
+		sPort := strconv.Itoa(opts.Port)
+		ipAddr, err := net.ResolveIPAddr("ip", opts.Host)
+		// If the host is "any" (0.0.0.0 or ::), get specific IPs from available
+		// interfaces.
+		if err == nil && ipAddr.IP.IsUnspecified() {
+			var ip net.IP
+			ifaces, _ := net.Interfaces()
+			for _, i := range ifaces {
+				addrs, _ := i.Addrs()
+				for _, addr := range addrs {
+					switch v := addr.(type) {
+					case *net.IPNet:
+						ip = v.IP
+					case *net.IPAddr:
+						ip = v.IP
+					}
+					// Skip non global unicast addresses
+					if !ip.IsGlobalUnicast() || ip.IsUnspecified() {
+						ip = nil
+						continue
+					}
+					urls = append(urls, net.JoinHostPort(ip.String(), sPort))
+				}
+			}
+		}
+		if err != nil || len(urls) == 0 {
+			// We are here if s.opts.Host is not "0.0.0.0" nor "::", or if for some
+			// reason we could not add any URL in the loop above.
+			// We had a case where a Windows VM was hosed and would have err == nil
+			// and not add any address in the array in the loop above, and we
+			// ended-up returning 0.0.0.0, which is problematic for Windows clients.
+			// Check for 0.0.0.0 or :: specifically, and ignore if that's the case.
+			if opts.Host == "0.0.0.0" || opts.Host == "::" {
+				s.Errorf("Address %q can not be resolved properly", opts.Host)
+			} else {
+				urls = append(urls, net.JoinHostPort(opts.Host, sPort))
+			}
+		}
+	}
+
+	return urls
+}
+
+// if the ip is not specified, attempt to resolve it
+func resolveHostPorts(addr net.Listener) []string {
+	hostPorts := make([]string, 0)
+	hp := addr.Addr().(*net.TCPAddr)
+	port := strconv.Itoa(hp.Port)
+	if hp.IP.IsUnspecified() {
 		var ip net.IP
 		ifaces, _ := net.Interfaces()
 		for _, i := range ifaces {
@@ -1006,30 +1393,272 @@ func (s *Server) getClientConnectURLs() []string {
 				switch v := addr.(type) {
 				case *net.IPNet:
 					ip = v.IP
+					hostPorts = append(hostPorts, net.JoinHostPort(ip.String(), port))
 				case *net.IPAddr:
 					ip = v.IP
-				}
-				// Skip non global unicast addresses
-				if !ip.IsGlobalUnicast() || ip.IsUnspecified() {
-					ip = nil
+					hostPorts = append(hostPorts, net.JoinHostPort(ip.String(), port))
+				default:
 					continue
 				}
-				urls = append(urls, net.JoinHostPort(ip.String(), sPort))
+			}
+		}
+	} else {
+		hostPorts = append(hostPorts, net.JoinHostPort(hp.IP.String(), port))
+	}
+	return hostPorts
+}
+
+// format the address of a net.Listener with a protocol
+func formatURL(protocol string, addr net.Listener) []string {
+	hostports := resolveHostPorts(addr)
+	for i, hp := range hostports {
+		hostports[i] = fmt.Sprintf("%s://%s", protocol, hp)
+	}
+	return hostports
+}
+
+// Ports describes URLs that the server can be contacted in
+type Ports struct {
+	Nats       []string `json:"nats,omitempty"`
+	Monitoring []string `json:"monitoring,omitempty"`
+	Cluster    []string `json:"cluster,omitempty"`
+	Profile    []string `json:"profile,omitempty"`
+}
+
+// PortsInfo attempts to resolve all the ports. If after maxWait the ports are not
+// resolved, it returns nil. Otherwise it returns a Ports struct
+// describing ports where the server can be contacted
+func (s *Server) PortsInfo(maxWait time.Duration) *Ports {
+	if s.readyForListeners(maxWait) {
+		opts := s.getOpts()
+
+		s.mu.Lock()
+		info := s.copyInfo()
+		listener := s.listener
+		httpListener := s.http
+		clusterListener := s.routeListener
+		profileListener := s.profiler
+		s.mu.Unlock()
+
+		ports := Ports{}
+
+		if listener != nil {
+			natsProto := "nats"
+			if info.TLSRequired {
+				natsProto = "tls"
+			}
+			ports.Nats = formatURL(natsProto, listener)
+		}
+
+		if httpListener != nil {
+			monProto := "http"
+			if opts.HTTPSPort != 0 {
+				monProto = "https"
+			}
+			ports.Monitoring = formatURL(monProto, httpListener)
+		}
+
+		if clusterListener != nil {
+			clusterProto := "nats"
+			if opts.Cluster.TLSConfig != nil {
+				clusterProto = "tls"
+			}
+			ports.Cluster = formatURL(clusterProto, clusterListener)
+		}
+
+		if profileListener != nil {
+			ports.Profile = formatURL("http", profileListener)
+		}
+
+		return &ports
+	}
+
+	return nil
+}
+
+// Returns the portsFile. If a non-empty dirHint is provided, the dirHint
+// path is used instead of the server option value
+func (s *Server) portFile(dirHint string) string {
+	dirname := s.getOpts().PortsFileDir
+	if dirHint != "" {
+		dirname = dirHint
+	}
+	if dirname == _EMPTY_ {
+		return _EMPTY_
+	}
+	return filepath.Join(dirname, fmt.Sprintf("%s_%d.ports", filepath.Base(os.Args[0]), os.Getpid()))
+}
+
+// Delete the ports file. If a non-empty dirHint is provided, the dirHint
+// path is used instead of the server option value
+func (s *Server) deletePortsFile(hintDir string) {
+	portsFile := s.portFile(hintDir)
+	if portsFile != "" {
+		if err := os.Remove(portsFile); err != nil {
+			s.Errorf("Error cleaning up ports file %s: %v", portsFile, err)
+		}
+	}
+}
+
+// Writes a file with a serialized Ports to the specified ports_file_dir.
+// The name of the file is `exename_pid.ports`, typically gnatsd_pid.ports.
+// if ports file is not set, this function has no effect
+func (s *Server) logPorts() {
+	opts := s.getOpts()
+	portsFile := s.portFile(opts.PortsFileDir)
+	if portsFile != _EMPTY_ {
+		go func() {
+			info := s.PortsInfo(5 * time.Second)
+			if info == nil {
+				s.Errorf("Unable to resolve the ports in the specified time")
+				return
+			}
+			data, err := json.Marshal(info)
+			if err != nil {
+				s.Errorf("Error marshaling ports file: %v", err)
+				return
+			}
+			if err := ioutil.WriteFile(portsFile, data, 0666); err != nil {
+				s.Errorf("Error writing ports file (%s): %v", portsFile, err)
+				return
+			}
+
+		}()
+	}
+}
+
+// waits until a calculated list of listeners is resolved or a timeout
+func (s *Server) readyForListeners(dur time.Duration) bool {
+	end := time.Now().Add(dur)
+	for time.Now().Before(end) {
+		s.mu.Lock()
+		listeners := s.serviceListeners()
+		s.mu.Unlock()
+		if len(listeners) == 0 {
+			return false
+		}
+
+		ok := true
+		for _, l := range listeners {
+			if l == nil {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+		select {
+		case <-s.quitCh:
+			return false
+		case <-time.After(25 * time.Millisecond):
+			// continue - unable to select from quit - we are still running
+		}
+	}
+	return false
+}
+
+// returns a list of listeners that are intended for the process
+// if the entry is nil, the interface is yet to be resolved
+func (s *Server) serviceListeners() []net.Listener {
+	listeners := make([]net.Listener, 0)
+	opts := s.getOpts()
+	listeners = append(listeners, s.listener)
+	if opts.Cluster.Port != 0 {
+		listeners = append(listeners, s.routeListener)
+	}
+	if opts.HTTPPort != 0 || opts.HTTPSPort != 0 {
+		listeners = append(listeners, s.http)
+	}
+	if opts.ProfPort != 0 {
+		listeners = append(listeners, s.profiler)
+	}
+	return listeners
+}
+
+// Returns true if in lame duck mode.
+func (s *Server) isLameDuckMode() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ldm
+}
+
+// This function will close the client listener then close the clients
+// at some interval to avoid a reconnecting storm.
+func (s *Server) lameDuckMode() {
+	s.mu.Lock()
+	// Check if there is actually anything to do
+	if s.shutdown || s.ldm || s.listener == nil {
+		s.mu.Unlock()
+		return
+	}
+	s.Noticef("Entering lame duck mode, stop accepting new clients")
+	s.ldm = true
+	s.ldmCh = make(chan bool, 1)
+	s.listener.Close()
+	s.listener = nil
+	s.mu.Unlock()
+
+	// Wait for accept loop to be done to make sure that no new
+	// client can connect
+	<-s.ldmCh
+
+	s.mu.Lock()
+	// Need to recheck few things
+	if s.shutdown || len(s.clients) == 0 {
+		s.mu.Unlock()
+		// If there is no client, we need to call Shutdown() to complete
+		// the LDMode. If server has been shutdown while lock was released,
+		// calling Shutdown() should be no-op.
+		s.Shutdown()
+		return
+	}
+	dur := int64(s.getOpts().LameDuckDuration)
+	numClients := int64(len(s.clients))
+	batch := 1
+	// Sleep interval between each client connection close.
+	si := dur / numClients
+	if si < 1 {
+		// Should not happen (except in test with very small LD duration), but
+		// if there are too many clients, batch the number of close and
+		// use a tiny sleep interval that will result in yield likely.
+		si = 1
+		batch = int(numClients / dur)
+	}
+	// Now capture all clients
+	clients := make([]*client, 0, len(s.clients))
+	for _, client := range s.clients {
+		clients = append(clients, client)
+	}
+	s.mu.Unlock()
+
+	t := time.NewTimer(time.Duration(atomic.LoadInt64(&lameDuckModeInitialDelay)))
+	// Delay start of closing of client connections in case
+	// we have several servers that we want to signal to enter LD mode
+	// and not have their client reconnect to each other.
+	select {
+	case <-t.C:
+		s.Noticef("Closing existing clients")
+	case <-s.quitCh:
+		return
+	}
+	for i, client := range clients {
+		client.closeConnection(ServerShutdown)
+		if batch == 1 || i%batch == 0 {
+			// We pick a random interval which will be at least si/2
+			v := rand.Int63n(si)
+			if v < si/2 {
+				v = si / 2
+			}
+			t.Reset(time.Duration(v))
+			// Sleep for given interval or bail out if kicked by Shutdown().
+			select {
+			case <-t.C:
+			case <-s.quitCh:
+				t.Stop()
+				return
 			}
 		}
 	}
-	if err != nil || len(urls) == 0 {
-		// We are here if s.opts.Host is not "0.0.0.0" nor "::", or if for some
-		// reason we could not add any URL in the loop above.
-		// We had a case where a Windows VM was hosed and would have err == nil
-		// and not add any address in the array in the loop above, and we
-		// ended-up returning 0.0.0.0, which is problematic for Windows clients.
-		// Check for 0.0.0.0 or :: specifically, and ignore if that's the case.
-		if opts.Host == "0.0.0.0" || opts.Host == "::" {
-			s.Errorf("Address %q can not be resolved properly", opts.Host)
-		} else {
-			urls = append(urls, net.JoinHostPort(opts.Host, sPort))
-		}
-	}
-	return urls
+	s.Shutdown()
 }

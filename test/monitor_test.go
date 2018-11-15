@@ -1,4 +1,15 @@
-// Copyright 2012-2015 Apcera Inc. All rights reserved.
+// Copyright 2012-2018 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package test
 
@@ -28,7 +39,7 @@ func runMonitorServer() *server.Server {
 	opts := DefaultTestOptions
 	opts.Port = CLIENT_PORT
 	opts.HTTPPort = MONITOR_PORT
-	opts.HTTPHost = "localhost"
+	opts.HTTPHost = "127.0.0.1"
 
 	return RunServer(&opts)
 }
@@ -39,9 +50,8 @@ func runMonitorServerClusteredPair(t *testing.T) (*server.Server, *server.Server
 	opts := DefaultTestOptions
 	opts.Port = CLIENT_PORT
 	opts.HTTPPort = MONITOR_PORT
-	opts.HTTPHost = "localhost"
-	opts.Cluster.Host = "127.0.0.1"
-	opts.Cluster.Port = 10223
+	opts.HTTPHost = "127.0.0.1"
+	opts.Cluster = server.ClusterOpts{Host: "127.0.0.1", Port: 10223}
 	opts.Routes = server.RoutesFromStr("nats-route://127.0.0.1:10222")
 
 	s1 := RunServer(&opts)
@@ -49,9 +59,8 @@ func runMonitorServerClusteredPair(t *testing.T) (*server.Server, *server.Server
 	opts2 := DefaultTestOptions
 	opts2.Port = CLIENT_PORT + 1
 	opts2.HTTPPort = MONITOR_PORT + 1
-	opts2.HTTPHost = "localhost"
-	opts2.Cluster.Host = "127.0.0.1"
-	opts2.Cluster.Port = 10222
+	opts2.HTTPHost = "127.0.0.1"
+	opts2.Cluster = server.ClusterOpts{Host: "127.0.0.1", Port: 10222}
 	opts2.Routes = server.RoutesFromStr("nats-route://127.0.0.1:10223")
 
 	s2 := RunServer(&opts2)
@@ -79,7 +88,7 @@ func TestNoMonitorPort(t *testing.T) {
 	s := runMonitorServerNoHTTPPort()
 	defer s.Shutdown()
 
-	url := fmt.Sprintf("http://localhost:%d/", MONITOR_PORT)
+	url := fmt.Sprintf("http://127.0.0.1:%d/", MONITOR_PORT)
 	if resp, err := http.Get(url + "varz"); err == nil {
 		t.Fatalf("Expected error: Got %+v\n", resp)
 	}
@@ -93,12 +102,12 @@ func TestNoMonitorPort(t *testing.T) {
 
 // testEndpointDataRace tests a monitoring endpoint for data races by polling
 // while client code acts to ensure statistics are updated. It is designed to
-// run under the -race flag to catch  violations. The caller must start the
+// run under the -race flag to catch violations. The caller must start the
 // NATS server.
 func testEndpointDataRace(endpoint string, t *testing.T) {
 	var doneWg sync.WaitGroup
 
-	url := fmt.Sprintf("http://localhost:%d/", MONITOR_PORT)
+	url := fmt.Sprintf("http://127.0.0.1:%d/", MONITOR_PORT)
 
 	// Poll as fast as we can, while creating connections, publishing,
 	// and subscribing.
@@ -157,7 +166,7 @@ func TestVarz(t *testing.T) {
 	s := runMonitorServer()
 	defer s.Shutdown()
 
-	url := fmt.Sprintf("http://localhost:%d/", MONITOR_PORT)
+	url := fmt.Sprintf("http://127.0.0.1:%d/", MONITOR_PORT)
 	resp, err := http.Get(url + "varz")
 	if err != nil {
 		t.Fatalf("Expected no error: Got %v\n", err)
@@ -197,6 +206,10 @@ func TestVarz(t *testing.T) {
 		t.Fatalf("Got an error reading the body: %v\n", err)
 	}
 
+	if strings.Contains(string(body), "cluster_port") {
+		t.Fatal("Varz body contains cluster information when no cluster is defined.")
+	}
+
 	v = server.Varz{}
 	if err := json.Unmarshal(body, &v); err != nil {
 		t.Fatalf("Got an error unmarshalling the body: %v\n", err)
@@ -217,13 +230,21 @@ func TestVarz(t *testing.T) {
 	if v.OutBytes != 5 {
 		t.Fatalf("Expected OutBytes of 5, got %v\n", v.OutBytes)
 	}
+	if v.MaxPending != server.MAX_PENDING_SIZE {
+		t.Fatalf("Expected MaxPending of %d, got %v\n",
+			server.MAX_PENDING_SIZE, v.MaxPending)
+	}
+	if v.WriteDeadline != server.DEFAULT_FLUSH_DEADLINE {
+		t.Fatalf("Expected WriteDeadline of %d, got %v\n",
+			server.DEFAULT_FLUSH_DEADLINE, v.WriteDeadline)
+	}
 }
 
 func TestConnz(t *testing.T) {
 	s := runMonitorServer()
 	defer s.Shutdown()
 
-	url := fmt.Sprintf("http://localhost:%d/", MONITOR_PORT)
+	url := fmt.Sprintf("http://127.0.0.1:%d/", MONITOR_PORT)
 	resp, err := http.Get(url + "connz")
 	if err != nil {
 		t.Fatalf("Expected no error: Got %v\n", err)
@@ -344,7 +365,7 @@ func TestTLSConnz(t *testing.T) {
 	// Wait for message
 	<-ch
 
-	url := fmt.Sprintf("https://localhost:%d/", opts.HTTPSPort)
+	url := fmt.Sprintf("https://127.0.0.1:%d/", opts.HTTPSPort)
 	tlsConfig := &tls.Config{}
 	caCert, err := ioutil.ReadFile(rootCAFile)
 	if err != nil {
@@ -444,7 +465,7 @@ func TestConnzWithSubs(t *testing.T) {
 	cl := createClientConnSubscribeAndPublish(t)
 	defer cl.Close()
 
-	url := fmt.Sprintf("http://localhost:%d/", MONITOR_PORT)
+	url := fmt.Sprintf("http://127.0.0.1:%d/", MONITOR_PORT)
 	resp, err := http.Get(url + "connz?subs=1")
 	if err != nil {
 		t.Fatalf("Expected no error: Got %v\n", err)
@@ -489,7 +510,7 @@ func TestConnzWithAuth(t *testing.T) {
 	// Wait for message
 	<-ch
 
-	url := fmt.Sprintf("http://localhost:%d/", opts.HTTPPort)
+	url := fmt.Sprintf("http://127.0.0.1:%d/", opts.HTTPPort)
 
 	resp, err := http.Get(url + "connz?auth=1")
 	if err != nil {
@@ -528,7 +549,7 @@ func TestConnzWithOffsetAndLimit(t *testing.T) {
 	cl2 := createClientConnSubscribeAndPublish(t)
 	defer cl2.Close()
 
-	url := fmt.Sprintf("http://localhost:%d/", MONITOR_PORT)
+	url := fmt.Sprintf("http://127.0.0.1:%d/", MONITOR_PORT)
 	resp, err := http.Get(url + "connz?offset=1&limit=1")
 	if err != nil {
 		t.Fatalf("Expected no error: Got %v\n", err)
@@ -567,7 +588,7 @@ func TestSubsz(t *testing.T) {
 	cl := createClientConnSubscribeAndPublish(t)
 	defer cl.Close()
 
-	url := fmt.Sprintf("http://localhost:%d/", MONITOR_PORT)
+	url := fmt.Sprintf("http://127.0.0.1:%d/", MONITOR_PORT)
 	resp, err := http.Get(url + "subscriptionsz")
 	if err != nil {
 		t.Fatalf("Expected no error: Got %v\n", err)
@@ -596,7 +617,7 @@ func TestHTTPHost(t *testing.T) {
 	s := runMonitorServer()
 	defer s.Shutdown()
 
-	// Grab non-localhost address and try to use that to connect.
+	// Grab non-127.0.0.1 address and try to use that to connect.
 	// Should fail.
 	var ip net.IP
 	ifaces, _ := net.Interfaces()
@@ -609,7 +630,7 @@ func TestHTTPHost(t *testing.T) {
 			case *net.IPAddr:
 				ip = v.IP
 			}
-			// Skip loopback/localhost or any ipv6 for now.
+			// Skip loopback/127.0.0.1 or any ipv6 for now.
 			if ip.IsLoopback() || ip.To4() == nil {
 				ip = nil
 				continue
@@ -631,9 +652,7 @@ func TestHTTPHost(t *testing.T) {
 
 // Create a connection to test ConnInfo
 func createClientConnSubscribeAndPublish(t *testing.T) net.Conn {
-	cl := createClientConn(t, "localhost", CLIENT_PORT)
-
-	sendCommand(t, cl)
+	cl := createClientConn(t, "127.0.0.1", CLIENT_PORT)
 	send, expect := setupConn(t, cl)
 	expectMsgs := expectMsgsCommand(t, expect)
 
@@ -646,7 +665,7 @@ func createClientConnSubscribeAndPublish(t *testing.T) net.Conn {
 func TestMonitorNoTLSConfig(t *testing.T) {
 	opts := DefaultTestOptions
 	opts.Port = CLIENT_PORT
-	opts.HTTPHost = "localhost"
+	opts.HTTPHost = "127.0.0.1"
 	opts.HTTPSPort = MONITOR_PORT
 	s := server.New(&opts)
 	defer s.Shutdown()
@@ -670,7 +689,7 @@ func TestMonitorErrorOnListen(t *testing.T) {
 
 	opts := DefaultTestOptions
 	opts.Port = CLIENT_PORT + 1
-	opts.HTTPHost = "localhost"
+	opts.HTTPHost = "127.0.0.1"
 	opts.HTTPPort = MONITOR_PORT
 	s2 := server.New(&opts)
 	defer s2.Shutdown()
@@ -682,7 +701,7 @@ func TestMonitorErrorOnListen(t *testing.T) {
 func TestMonitorBothPortsConfigured(t *testing.T) {
 	opts := DefaultTestOptions
 	opts.Port = CLIENT_PORT
-	opts.HTTPHost = "localhost"
+	opts.HTTPHost = "127.0.0.1"
 	opts.HTTPPort = MONITOR_PORT
 	opts.HTTPSPort = MONITOR_PORT + 1
 	s := server.New(&opts)
@@ -696,7 +715,7 @@ func TestMonitorStop(t *testing.T) {
 	resetPreviousHTTPConnections()
 	opts := DefaultTestOptions
 	opts.Port = CLIENT_PORT
-	opts.HTTPHost = "localhost"
+	opts.HTTPHost = "127.0.0.1"
 	opts.HTTPPort = MONITOR_PORT
 	url := fmt.Sprintf("http://%v:%d/", opts.HTTPHost, MONITOR_PORT)
 	// Create a server instance and start only the monitoring http server.

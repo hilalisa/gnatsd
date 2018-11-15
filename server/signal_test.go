@@ -1,4 +1,16 @@
-// Copyright 2017 Apcera Inc. All rights reserved.
+// Copyright 2012-2018 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // +build !windows
 
 package server
@@ -8,6 +20,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"strings"
 	"syscall"
 	"testing"
@@ -21,7 +34,7 @@ func TestSignalToReOpenLogFile(t *testing.T) {
 	defer os.Remove(logFile)
 	defer os.Remove(logFile + ".bak")
 	opts := &Options{
-		Host:    "localhost",
+		Host:    "127.0.0.1",
 		Port:    -1,
 		NoSigs:  false,
 		LogFile: logFile,
@@ -71,22 +84,33 @@ func TestSignalToReloadConfig(t *testing.T) {
 	s := RunServer(opts)
 	defer s.Shutdown()
 
-	loaded := s.ConfigTime()
+	// Repeat test to make sure that server services signals more than once...
+	for i := 0; i < 2; i++ {
+		loaded := s.ConfigTime()
 
-	// Wait a bit to ensure ConfigTime changes.
-	time.Sleep(5 * time.Millisecond)
+		// Wait a bit to ensure ConfigTime changes.
+		time.Sleep(5 * time.Millisecond)
 
-	// This should cause config to be reloaded.
-	syscall.Kill(syscall.Getpid(), syscall.SIGHUP)
-	// Wait a bit for action to be performed
-	time.Sleep(500 * time.Millisecond)
+		// This should cause config to be reloaded.
+		syscall.Kill(syscall.Getpid(), syscall.SIGHUP)
+		// Wait a bit for action to be performed
+		time.Sleep(500 * time.Millisecond)
 
-	if reloaded := s.ConfigTime(); !reloaded.After(loaded) {
-		t.Fatalf("ConfigTime is incorrect.\nexpected greater than: %s\ngot: %s", loaded, reloaded)
+		if reloaded := s.ConfigTime(); !reloaded.After(loaded) {
+			t.Fatalf("ConfigTime is incorrect.\nexpected greater than: %s\ngot: %s", loaded, reloaded)
+		}
 	}
 }
 
 func TestProcessSignalNoProcesses(t *testing.T) {
+	pgrepBefore := pgrep
+	pgrep = func() ([]byte, error) {
+		return nil, &exec.ExitError{}
+	}
+	defer func() {
+		pgrep = pgrepBefore
+	}()
+
 	err := ProcessSignal(CommandStop, "")
 	if err == nil {
 		t.Fatal("Expected error")
@@ -281,6 +305,32 @@ func TestProcessSignalReloadProcess(t *testing.T) {
 	}()
 
 	if err := ProcessSignal(CommandReload, "123"); err != nil {
+		t.Fatalf("ProcessSignal failed: %v", err)
+	}
+
+	if !called {
+		t.Fatal("Expected kill to be called")
+	}
+}
+
+func TestProcessSignalLameDuckMode(t *testing.T) {
+	killBefore := kill
+	called := false
+	kill = func(pid int, signal syscall.Signal) error {
+		called = true
+		if pid != 123 {
+			t.Fatalf("pid is incorrect.\nexpected: 123\ngot: %d", pid)
+		}
+		if signal != syscall.SIGUSR2 {
+			t.Fatalf("signal is incorrect.\nexpected: sigusr2\ngot: %v", signal)
+		}
+		return nil
+	}
+	defer func() {
+		kill = killBefore
+	}()
+
+	if err := ProcessSignal(commandLDMode, "123"); err != nil {
 		t.Fatalf("ProcessSignal failed: %v", err)
 	}
 

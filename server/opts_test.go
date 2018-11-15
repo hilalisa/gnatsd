@@ -1,4 +1,15 @@
-// Copyright 2013-2016 Apcera Inc. All rights reserved.
+// Copyright 2012-2018 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package server
 
@@ -6,6 +17,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"io/ioutil"
 	"net/url"
 	"os"
@@ -17,22 +29,21 @@ import (
 
 func TestDefaultOptions(t *testing.T) {
 	golden := &Options{
-		Host:           DEFAULT_HOST,
-		Port:           DEFAULT_PORT,
-		MaxConn:        DEFAULT_MAX_CONNECTIONS,
-		HTTPHost:       DEFAULT_HOST,
-		PingInterval:   DEFAULT_PING_INTERVAL,
-		MaxPingsOut:    DEFAULT_PING_MAX_OUT,
-		TLSTimeout:     float64(TLS_TIMEOUT) / float64(time.Second),
-		AuthTimeout:    float64(AUTH_TIMEOUT) / float64(time.Second),
-		MaxControlLine: MAX_CONTROL_LINE_SIZE,
-		MaxPayload:     MAX_PAYLOAD_SIZE,
-		Cluster: ClusterOpts{
-			Host:        DEFAULT_HOST,
-			AuthTimeout: float64(AUTH_TIMEOUT) / float64(time.Second),
-			TLSTimeout:  float64(TLS_TIMEOUT) / float64(time.Second),
-		},
-		WriteDeadline: DEFAULT_FLUSH_DEADLINE,
+		Host:             DEFAULT_HOST,
+		Port:             DEFAULT_PORT,
+		MaxConn:          DEFAULT_MAX_CONNECTIONS,
+		HTTPHost:         DEFAULT_HOST,
+		PingInterval:     DEFAULT_PING_INTERVAL,
+		MaxPingsOut:      DEFAULT_PING_MAX_OUT,
+		TLSTimeout:       float64(TLS_TIMEOUT) / float64(time.Second),
+		AuthTimeout:      float64(AUTH_TIMEOUT) / float64(time.Second),
+		MaxControlLine:   MAX_CONTROL_LINE_SIZE,
+		MaxPayload:       MAX_PAYLOAD_SIZE,
+		MaxPending:       MAX_PENDING_SIZE,
+		WriteDeadline:    DEFAULT_FLUSH_DEADLINE,
+		RQSubsSweep:      DEFAULT_REMOTE_QSUBS_SWEEPER,
+		MaxClosedClients: DEFAULT_MAX_CLOSED_CLIENTS,
+		LameDuckDuration: DEFAULT_LAME_DUCK_DURATION,
 	}
 
 	opts := &Options{}
@@ -56,26 +67,29 @@ func TestOptions_RandomPort(t *testing.T) {
 
 func TestConfigFile(t *testing.T) {
 	golden := &Options{
-		ConfigFile:     "./configs/test.conf",
-		Host:           "localhost",
-		Port:           4242,
-		Username:       "derek",
-		Password:       "bella",
-		AuthTimeout:    1.0,
-		Debug:          false,
-		Trace:          true,
-		Logtime:        false,
-		HTTPPort:       8222,
-		PidFile:        "/tmp/gnatsd.pid",
-		ProfPort:       6543,
-		Syslog:         true,
-		RemoteSyslog:   "udp://foo.com:33",
-		MaxControlLine: 2048,
-		MaxPayload:     65536,
-		MaxConn:        100,
-		PingInterval:   60 * time.Second,
-		MaxPingsOut:    3,
-		WriteDeadline:  3 * time.Second,
+		ConfigFile:       "./configs/test.conf",
+		Host:             "127.0.0.1",
+		Port:             4242,
+		Username:         "derek",
+		Password:         "porkchop",
+		AuthTimeout:      1.0,
+		Debug:            false,
+		Trace:            true,
+		Logtime:          false,
+		HTTPPort:         8222,
+		PidFile:          "/tmp/gnatsd.pid",
+		ProfPort:         6543,
+		Syslog:           true,
+		RemoteSyslog:     "udp://foo.com:33",
+		MaxControlLine:   2048,
+		MaxPayload:       65536,
+		MaxConn:          100,
+		MaxSubs:          1000,
+		MaxPending:       10000000,
+		PingInterval:     60 * time.Second,
+		MaxPingsOut:      3,
+		WriteDeadline:    3 * time.Second,
+		LameDuckDuration: 4 * time.Second,
 	}
 
 	opts, err := ProcessConfigFile("./configs/test.conf")
@@ -92,7 +106,7 @@ func TestConfigFile(t *testing.T) {
 func TestTLSConfigFile(t *testing.T) {
 	golden := &Options{
 		ConfigFile:  "./configs/tls.conf",
-		Host:        "localhost",
+		Host:        "127.0.0.1",
 		Port:        4443,
 		Username:    "derek",
 		Password:    "foo",
@@ -129,7 +143,7 @@ func TestTLSConfigFile(t *testing.T) {
 		t.Fatal("Expected 1 certificate")
 	}
 	cert := tlsConfig.Certificates[0].Leaf
-	if err := cert.VerifyHostname("localhost"); err != nil {
+	if err := cert.VerifyHostname("127.0.0.1"); err != nil {
 		t.Fatalf("Could not verify hostname in certificate: %v\n", err)
 	}
 
@@ -212,10 +226,10 @@ func TestTLSConfigFile(t *testing.T) {
 func TestMergeOverrides(t *testing.T) {
 	golden := &Options{
 		ConfigFile:     "./configs/test.conf",
-		Host:           "localhost",
+		Host:           "127.0.0.1",
 		Port:           2222,
 		Username:       "derek",
-		Password:       "spooky",
+		Password:       "porkchop",
 		AuthTimeout:    1.0,
 		Debug:          true,
 		Trace:          true,
@@ -228,13 +242,16 @@ func TestMergeOverrides(t *testing.T) {
 		MaxControlLine: 2048,
 		MaxPayload:     65536,
 		MaxConn:        100,
+		MaxSubs:        1000,
+		MaxPending:     10000000,
 		PingInterval:   60 * time.Second,
 		MaxPingsOut:    3,
 		Cluster: ClusterOpts{
 			NoAdvertise:    true,
 			ConnectRetries: 2,
 		},
-		WriteDeadline: 3 * time.Second,
+		WriteDeadline:    3 * time.Second,
+		LameDuckDuration: 4 * time.Second,
 	}
 	fopts, err := ProcessConfigFile("./configs/test.conf")
 	if err != nil {
@@ -244,7 +261,7 @@ func TestMergeOverrides(t *testing.T) {
 	// Overrides via flags
 	opts := &Options{
 		Port:     2222,
-		Password: "spooky",
+		Password: "porkchop",
 		Debug:    true,
 		HTTPPort: DEFAULT_HTTP_PORT,
 		ProfPort: 6789,
@@ -263,7 +280,7 @@ func TestMergeOverrides(t *testing.T) {
 
 func TestRemoveSelfReference(t *testing.T) {
 	url1, _ := url.Parse("nats-route://user:password@10.4.5.6:4223")
-	url2, _ := url.Parse("nats-route://user:password@localhost:4223")
+	url2, _ := url.Parse("nats-route://user:password@127.0.0.1:4223")
 	url3, _ := url.Parse("nats-route://user:password@127.0.0.1:4223")
 
 	routes := []*url.URL{url1, url2, url3}
@@ -409,6 +426,22 @@ func TestRouteFlagOverrideWithMultiple(t *testing.T) {
 	if !reflect.DeepEqual(golden, merged) {
 		t.Fatalf("Options are incorrect.\nexpected: %+v\ngot: %+v",
 			golden, merged)
+	}
+}
+
+func TestDynamicPortOnListen(t *testing.T) {
+	opts, err := ProcessConfigFile("./configs/listen-1.conf")
+	if err != nil {
+		t.Fatalf("Received an error reading config file: %v\n", err)
+	}
+	if opts.Port != -1 {
+		t.Fatalf("Received incorrect port %v, expected -1\n", opts.Port)
+	}
+	if opts.HTTPPort != -1 {
+		t.Fatalf("Received incorrect monitoring port %v, expected -1\n", opts.HTTPPort)
+	}
+	if opts.HTTPSPort != -1 {
+		t.Fatalf("Received incorrect secure monitoring port %v, expected -1\n", opts.HTTPSPort)
 	}
 }
 
@@ -558,22 +591,22 @@ func TestAuthorizationConfig(t *testing.T) {
 	if alice.Permissions.Publish == nil {
 		t.Fatalf("Expected Alice's publish permissions to be non-nil\n")
 	}
-	if len(alice.Permissions.Publish) != 1 {
+	if len(alice.Permissions.Publish.Allow) != 1 {
 		t.Fatalf("Expected Alice's publish permissions to have 1 element, got %d\n",
-			len(alice.Permissions.Publish))
+			len(alice.Permissions.Publish.Allow))
 	}
-	pubPerm := alice.Permissions.Publish[0]
+	pubPerm := alice.Permissions.Publish.Allow[0]
 	if pubPerm != "*" {
 		t.Fatalf("Expected Alice's publish permissions to be '*', got %q\n", pubPerm)
 	}
 	if alice.Permissions.Subscribe == nil {
 		t.Fatalf("Expected Alice's subscribe permissions to be non-nil\n")
 	}
-	if len(alice.Permissions.Subscribe) != 1 {
+	if len(alice.Permissions.Subscribe.Allow) != 1 {
 		t.Fatalf("Expected Alice's subscribe permissions to have 1 element, got %d\n",
-			len(alice.Permissions.Subscribe))
+			len(alice.Permissions.Subscribe.Allow))
 	}
-	subPerm := alice.Permissions.Subscribe[0]
+	subPerm := alice.Permissions.Subscribe.Allow[0]
 	if subPerm != ">" {
 		t.Fatalf("Expected Alice's subscribe permissions to be '>', got %q\n", subPerm)
 	}
@@ -605,13 +638,227 @@ func TestAuthorizationConfig(t *testing.T) {
 	if susan.Permissions.Subscribe == nil {
 		t.Fatalf("Expected Susan's subscribe permissions to be non-nil\n")
 	}
-	if len(susan.Permissions.Subscribe) != 1 {
+	if len(susan.Permissions.Subscribe.Allow) != 1 {
 		t.Fatalf("Expected Susan's subscribe permissions to have 1 element, got %d\n",
-			len(susan.Permissions.Subscribe))
+			len(susan.Permissions.Subscribe.Allow))
 	}
-	subPerm = susan.Permissions.Subscribe[0]
+	subPerm = susan.Permissions.Subscribe.Allow[0]
 	if subPerm != "PUBLIC.>" {
 		t.Fatalf("Expected Susan's subscribe permissions to be 'PUBLIC.>', got %q\n", subPerm)
+	}
+}
+
+// Test highly depends on contents of the config file listed below. Any changes to that file
+// may very well break this test.
+func TestNewStyleAuthorizationConfig(t *testing.T) {
+	opts, err := ProcessConfigFile("./configs/new_style_authorization.conf")
+	if err != nil {
+		t.Fatalf("Received an error reading config file: %v\n", err)
+	}
+	processOptions(opts)
+
+	lu := len(opts.Users)
+	if lu != 2 {
+		t.Fatalf("Expected 2 users, got %d\n", lu)
+	}
+	// Build a map
+	mu := make(map[string]*User)
+	for _, u := range opts.Users {
+		mu[u.Username] = u
+	}
+	// Alice
+	alice, ok := mu["alice"]
+	if !ok {
+		t.Fatalf("Expected to see user Alice\n")
+	}
+	if alice.Permissions == nil {
+		t.Fatalf("Expected Alice's permissions to be non-nil\n")
+	}
+
+	if alice.Permissions.Publish == nil {
+		t.Fatalf("Expected Alice's publish permissions to be non-nil\n")
+	}
+	if len(alice.Permissions.Publish.Allow) != 3 {
+		t.Fatalf("Expected Alice's allowed publish permissions to have 3 elements, got %d\n",
+			len(alice.Permissions.Publish.Allow))
+	}
+	pubPerm := alice.Permissions.Publish.Allow[0]
+	if pubPerm != "foo" {
+		t.Fatalf("Expected Alice's first allowed publish permission to be 'foo', got %q\n", pubPerm)
+	}
+	pubPerm = alice.Permissions.Publish.Allow[1]
+	if pubPerm != "bar" {
+		t.Fatalf("Expected Alice's second allowed publish permission to be 'bar', got %q\n", pubPerm)
+	}
+	pubPerm = alice.Permissions.Publish.Allow[2]
+	if pubPerm != "baz" {
+		t.Fatalf("Expected Alice's third allowed publish permission to be 'baz', got %q\n", pubPerm)
+	}
+	if len(alice.Permissions.Publish.Deny) != 0 {
+		t.Fatalf("Expected Alice's denied publish permissions to have 0 elements, got %d\n",
+			len(alice.Permissions.Publish.Deny))
+	}
+
+	if alice.Permissions.Subscribe == nil {
+		t.Fatalf("Expected Alice's subscribe permissions to be non-nil\n")
+	}
+	if len(alice.Permissions.Subscribe.Allow) != 0 {
+		t.Fatalf("Expected Alice's allowed subscribe permissions to have 0 elements, got %d\n",
+			len(alice.Permissions.Subscribe.Allow))
+	}
+	if len(alice.Permissions.Subscribe.Deny) != 1 {
+		t.Fatalf("Expected Alice's denied subscribe permissions to have 1 element, got %d\n",
+			len(alice.Permissions.Subscribe.Deny))
+	}
+	subPerm := alice.Permissions.Subscribe.Deny[0]
+	if subPerm != "$SYSTEM.>" {
+		t.Fatalf("Expected Alice's only denied subscribe permission to be '$SYSTEM.>', got %q\n", subPerm)
+	}
+
+	// Bob
+	bob, ok := mu["bob"]
+	if !ok {
+		t.Fatalf("Expected to see user Bob\n")
+	}
+	if bob.Permissions == nil {
+		t.Fatalf("Expected Bob's permissions to be non-nil\n")
+	}
+
+	if bob.Permissions.Publish == nil {
+		t.Fatalf("Expected Bobs's publish permissions to be non-nil\n")
+	}
+	if len(bob.Permissions.Publish.Allow) != 1 {
+		t.Fatalf("Expected Bob's allowed publish permissions to have 1 element, got %d\n",
+			len(bob.Permissions.Publish.Allow))
+	}
+	pubPerm = bob.Permissions.Publish.Allow[0]
+	if pubPerm != "$SYSTEM.>" {
+		t.Fatalf("Expected Bob's first allowed publish permission to be '$SYSTEM.>', got %q\n", pubPerm)
+	}
+	if len(bob.Permissions.Publish.Deny) != 0 {
+		t.Fatalf("Expected Bob's denied publish permissions to have 0 elements, got %d\n",
+			len(bob.Permissions.Publish.Deny))
+	}
+
+	if bob.Permissions.Subscribe == nil {
+		t.Fatalf("Expected Bob's subscribe permissions to be non-nil\n")
+	}
+	if len(bob.Permissions.Subscribe.Allow) != 0 {
+		t.Fatalf("Expected Bob's allowed subscribe permissions to have 0 elements, got %d\n",
+			len(bob.Permissions.Subscribe.Allow))
+	}
+	if len(bob.Permissions.Subscribe.Deny) != 3 {
+		t.Fatalf("Expected Bobs's denied subscribe permissions to have 3 elements, got %d\n",
+			len(bob.Permissions.Subscribe.Deny))
+	}
+	subPerm = bob.Permissions.Subscribe.Deny[0]
+	if subPerm != "foo" {
+		t.Fatalf("Expected Bobs's first denied subscribe permission to be 'foo', got %q\n", subPerm)
+	}
+	subPerm = bob.Permissions.Subscribe.Deny[1]
+	if subPerm != "bar" {
+		t.Fatalf("Expected Bobs's second denied subscribe permission to be 'bar', got %q\n", subPerm)
+	}
+	subPerm = bob.Permissions.Subscribe.Deny[2]
+	if subPerm != "baz" {
+		t.Fatalf("Expected Bobs's third denied subscribe permission to be 'baz', got %q\n", subPerm)
+	}
+}
+
+// Test new nkey users
+func TestNkeyUsersConfig(t *testing.T) {
+	confFileName := createConfFile(t, []byte(`
+    authorization {
+      users = [
+        {nkey: "UDKTV7HZVYJFJN64LLMYQBUR6MTNNYCDC3LAZH4VHURW3GZLL3FULBXV"}
+        {nkey: "UA3C5TBZYK5GJQJRWPMU6NFY5JNAEVQB2V2TUZFZDHFJFUYVKTTUOFKZ"}
+      ]
+    }`))
+	defer os.Remove(confFileName)
+	opts, err := ProcessConfigFile(confFileName)
+	if err != nil {
+		t.Fatalf("Received an error reading config file: %v", err)
+	}
+	lu := len(opts.Nkeys)
+	if lu != 2 {
+		t.Fatalf("Expected 2 nkey users, got %d", lu)
+	}
+}
+
+func TestNkeyUsersWithPermsConfig(t *testing.T) {
+	confFileName := createConfFile(t, []byte(`
+    authorization {
+      users = [
+        {nkey: "UDKTV7HZVYJFJN64LLMYQBUR6MTNNYCDC3LAZH4VHURW3GZLL3FULBXV",
+         permissions = {
+           publish = "$SYSTEM.>"
+           subscribe = { deny = ["foo", "bar", "baz"] }
+         }
+        }
+      ]
+    }`))
+	defer os.Remove(confFileName)
+	opts, err := ProcessConfigFile(confFileName)
+	if err != nil {
+		t.Fatalf("Received an error reading config file: %v", err)
+	}
+	lu := len(opts.Nkeys)
+	if lu != 1 {
+		t.Fatalf("Expected 1 nkey user, got %d", lu)
+	}
+	nk := opts.Nkeys[0]
+	if nk.Permissions == nil {
+		fmt.Printf("nk is %+v\n", nk)
+		t.Fatal("Expected to have permissions")
+	}
+	if nk.Permissions.Publish == nil {
+		t.Fatal("Expected to have publish permissions")
+	}
+	if nk.Permissions.Publish.Allow[0] != "$SYSTEM.>" {
+		t.Fatalf("Expected publish to allow \"$SYSTEM.>\", but got %v\n", nk.Permissions.Publish.Allow[0])
+	}
+	if nk.Permissions.Subscribe == nil {
+		t.Fatal("Expected to have subscribe permissions")
+	}
+	if nk.Permissions.Subscribe.Allow != nil {
+		t.Fatal("Expected to have no subscribe allow permissions")
+	}
+	deny := nk.Permissions.Subscribe.Deny
+	if deny == nil || len(deny) != 3 ||
+		deny[0] != "foo" || deny[1] != "bar" || deny[2] != "baz" {
+		t.Fatalf("Expected to have subscribe deny permissions, got %v", deny)
+	}
+}
+
+func TestBadNkeyConfig(t *testing.T) {
+	confFileName := "nkeys_bad.conf"
+	defer os.Remove(confFileName)
+	content := `
+    authorization {
+      users = [ {nkey: "Ufoo"}]
+    }`
+	if err := ioutil.WriteFile(confFileName, []byte(content), 0666); err != nil {
+		t.Fatalf("Error writing config file: %v", err)
+	}
+	if _, err := ProcessConfigFile(confFileName); err == nil {
+		t.Fatalf("Expected an error from nkey entry with password")
+	}
+}
+
+func TestNkeyWithPassConfig(t *testing.T) {
+	confFileName := "nkeys_pass.conf"
+	defer os.Remove(confFileName)
+	content := `
+    authorization {
+      users = [
+        {nkey: "UDKTV7HZVYJFJN64LLMYQBUR6MTNNYCDC3LAZH4VHURW3GZLL3FULBXV", pass: "foo"}
+      ]
+    }`
+	if err := ioutil.WriteFile(confFileName, []byte(content), 0666); err != nil {
+		t.Fatalf("Error writing config file: %v", err)
+	}
+	if _, err := ProcessConfigFile(confFileName); err == nil {
+		t.Fatalf("Expected an error from bad nkey entry")
 	}
 }
 
@@ -705,10 +952,10 @@ func TestParseWriteDeadline(t *testing.T) {
 func TestOptionsClone(t *testing.T) {
 	opts := &Options{
 		ConfigFile:     "./configs/test.conf",
-		Host:           "localhost",
+		Host:           "127.0.0.1",
 		Port:           2222,
 		Username:       "derek",
-		Password:       "spooky",
+		Password:       "porkchop",
 		AuthTimeout:    1.0,
 		Debug:          true,
 		Trace:          true,
@@ -936,15 +1183,15 @@ func TestConfigureOptions(t *testing.T) {
 	}
 
 	// This should fail since -cluster is missing
-	expectedURL, _ := url.Parse("nats://localhost:6223")
+	expectedURL, _ := url.Parse("nats://127.0.0.1:6223")
 	expectToFail([]string{"-routes", expectedURL.String()}, "solicited routes")
 
 	// Ensure that we can set cluster and routes from command line
-	opts = mustNotFail([]string{"-cluster", "nats://localhost:6222", "-routes", expectedURL.String()})
-	if opts.Cluster.ListenStr != "nats://localhost:6222" {
+	opts = mustNotFail([]string{"-cluster", "nats://127.0.0.1:6222", "-routes", expectedURL.String()})
+	if opts.Cluster.ListenStr != "nats://127.0.0.1:6222" {
 		t.Fatalf("Unexpected Cluster.ListenStr=%q", opts.Cluster.ListenStr)
 	}
-	if opts.RoutesStr != "nats://localhost:6223" || len(opts.Routes) != 1 || opts.Routes[0].String() != expectedURL.String() {
+	if opts.RoutesStr != "nats://127.0.0.1:6223" || len(opts.Routes) != 1 || opts.Routes[0].String() != expectedURL.String() {
 		t.Fatalf("Unexpected RoutesStr: %q and Routes: %v", opts.RoutesStr, opts.Routes)
 	}
 
@@ -957,7 +1204,7 @@ func TestConfigureOptions(t *testing.T) {
 
 	// Use a config with cluster configuration and override cluster listen string
 	expectedURL, _ = url.Parse("nats-route://ruser:top_secret@127.0.0.1:7246")
-	opts = mustNotFail([]string{"-c", "./configs/srv_a.conf", "-cluster", "nats://ivan:pwd@localhost:6222"})
+	opts = mustNotFail([]string{"-c", "./configs/srv_a.conf", "-cluster", "nats://ivan:pwd@127.0.0.1:6222"})
 	if opts.Cluster.Username != "ivan" || opts.Cluster.Password != "pwd" || opts.Cluster.Port != 6222 ||
 		len(opts.Routes) != 1 || opts.Routes[0].String() != expectedURL.String() {
 		t.Fatalf("Unexpected Cluster and/or Routes: %#v - %v", opts.Cluster, opts.Routes)
@@ -973,10 +1220,10 @@ func TestConfigureOptions(t *testing.T) {
 	// (adding -routes to have more than 1 set flag to check
 	// that Visit() stops when an error is found).
 	expectToFail([]string{"-cluster", ":", "-routes", ""}, "protocol")
-	expectToFail([]string{"-cluster", "nats://localhost", "-routes", ""}, "port")
-	expectToFail([]string{"-cluster", "nats://localhost:xxx", "-routes", ""}, "integer")
-	expectToFail([]string{"-cluster", "nats://ivan:localhost:6222", "-routes", ""}, "colons")
-	expectToFail([]string{"-cluster", "nats://ivan@localhost:6222", "-routes", ""}, "password")
+	expectToFail([]string{"-cluster", "nats://127.0.0.1", "-routes", ""}, "port")
+	expectToFail([]string{"-cluster", "nats://127.0.0.1:xxx", "-routes", ""}, "integer")
+	expectToFail([]string{"-cluster", "nats://ivan:127.0.0.1:6222", "-routes", ""}, "colons")
+	expectToFail([]string{"-cluster", "nats://ivan@127.0.0.1:6222", "-routes", ""}, "password")
 
 	// Override config file's TLS configuration from command line, and completely disable TLS
 	opts = mustNotFail([]string{"-c", "./configs/tls.conf", "-tls=false"})
@@ -1004,5 +1251,202 @@ func TestConfigureOptions(t *testing.T) {
 	opts = mustNotFail([]string{"-tls", "-tlscert", "./configs/certs/server.pem", "-tlskey", "./configs/certs/key.pem"})
 	if opts.TLSConfig == nil || !opts.TLS {
 		t.Fatal("Expected TLSConfig to be set")
+	}
+}
+
+func TestClusterPermissionsConfig(t *testing.T) {
+	template := `
+		cluster {
+			port: 1234
+			%s
+			authorization {
+				user: ivan
+				password: pwd
+				permissions {
+					import {
+						allow: "foo"
+					}
+					export {
+						allow: "bar"
+					}
+				}
+			}
+		}
+	`
+	conf := createConfFile(t, []byte(fmt.Sprintf(template, "")))
+	defer os.Remove(conf)
+	opts, err := ProcessConfigFile(conf)
+	if err != nil {
+		if cerr, ok := err.(*processConfigErr); ok && len(cerr.Errors()) > 0 {
+			t.Fatalf("Error processing config file: %v", err)
+		}
+	}
+	if opts.Cluster.Permissions == nil {
+		t.Fatal("Expected cluster permissions to be set")
+	}
+	if opts.Cluster.Permissions.Import == nil {
+		t.Fatal("Expected cluster import permissions to be set")
+	}
+	if len(opts.Cluster.Permissions.Import.Allow) != 1 || opts.Cluster.Permissions.Import.Allow[0] != "foo" {
+		t.Fatalf("Expected cluster import permissions to have %q, got %v", "foo", opts.Cluster.Permissions.Import.Allow)
+	}
+	if opts.Cluster.Permissions.Export == nil {
+		t.Fatal("Expected cluster export permissions to be set")
+	}
+	if len(opts.Cluster.Permissions.Export.Allow) != 1 || opts.Cluster.Permissions.Export.Allow[0] != "bar" {
+		t.Fatalf("Expected cluster export permissions to have %q, got %v", "bar", opts.Cluster.Permissions.Export.Allow)
+	}
+
+	// Now add permissions in top level cluster and check
+	// that this is the one that is being used.
+	conf = createConfFile(t, []byte(fmt.Sprintf(template, `
+		permissions {
+			import {
+				allow: "baz"
+			}
+			export {
+				allow: "bat"
+			}
+		}
+	`)))
+	defer os.Remove(conf)
+	opts, err = ProcessConfigFile(conf)
+	if err != nil {
+		t.Fatalf("Error processing config file: %v", err)
+	}
+	if opts.Cluster.Permissions == nil {
+		t.Fatal("Expected cluster permissions to be set")
+	}
+	if opts.Cluster.Permissions.Import == nil {
+		t.Fatal("Expected cluster import permissions to be set")
+	}
+	if len(opts.Cluster.Permissions.Import.Allow) != 1 || opts.Cluster.Permissions.Import.Allow[0] != "baz" {
+		t.Fatalf("Expected cluster import permissions to have %q, got %v", "baz", opts.Cluster.Permissions.Import.Allow)
+	}
+	if opts.Cluster.Permissions.Export == nil {
+		t.Fatal("Expected cluster export permissions to be set")
+	}
+	if len(opts.Cluster.Permissions.Export.Allow) != 1 || opts.Cluster.Permissions.Export.Allow[0] != "bat" {
+		t.Fatalf("Expected cluster export permissions to have %q, got %v", "bat", opts.Cluster.Permissions.Export.Allow)
+	}
+
+	// Tests with invalid permissions
+	invalidPerms := []string{
+		`permissions: foo`,
+		`permissions {
+			unknown_field: "foo"
+		}`,
+		`permissions {
+			import: [1, 2, 3]
+		}`,
+		`permissions {
+			import {
+				unknown_field: "foo"
+			}
+		}`,
+		`permissions {
+			import {
+				allow {
+					x: y
+				}
+			}
+		}`,
+		`permissions {
+			import {
+				deny {
+					x: y
+				}
+			}
+		}`,
+		`permissions {
+			export: [1, 2, 3]
+		}`,
+		`permissions {
+			export {
+				unknown_field: "foo"
+			}
+		}`,
+		`permissions {
+			export {
+				allow {
+					x: y
+				}
+			}
+		}`,
+		`permissions {
+			export {
+				deny {
+					x: y
+				}
+			}
+		}`,
+	}
+	for _, perms := range invalidPerms {
+		conf = createConfFile(t, []byte(fmt.Sprintf(`
+			cluster {
+				port: 1234
+				%s
+			}
+		`, perms)))
+		_, err := ProcessConfigFile(conf)
+		os.Remove(conf)
+		if err == nil {
+			t.Fatalf("Expected failure for permissions %s", perms)
+		}
+	}
+
+	for _, perms := range invalidPerms {
+		conf = createConfFile(t, []byte(fmt.Sprintf(`
+			cluster {
+				port: 1234
+				authorization {
+					user: ivan
+					password: pwd
+					%s
+				}
+			}
+		`, perms)))
+		_, err := ProcessConfigFile(conf)
+		os.Remove(conf)
+		if err == nil {
+			t.Fatalf("Expected failure for permissions %s", perms)
+		}
+	}
+}
+
+func TestAccountUsersLoadedProperly(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+	listen: "127.0.0.1:-1"
+	authorization {
+		users [
+			{user: ivan, password: bar}
+			{nkey : UC6NLCN7AS34YOJVCYD4PJ3QB7QGLYG5B5IMBT25VW5K4TNUJODM7BOX}
+		]
+	}
+	accounts {
+		synadia {
+			users [
+				{user: derek, password: foo}
+				{nkey : UBAAQWTW6CG2G6ANGNKB5U2B7HRWHSGMZEZX3AQSAJOQDAUGJD46LD2E}
+			]
+		}
+	}
+	`))
+	check := func(t *testing.T) {
+		t.Helper()
+		s, _ := RunServerWithConfig(conf)
+		defer s.Shutdown()
+		opts := s.getOpts()
+		if n := len(opts.Users); n != 2 {
+			t.Fatalf("Should have 2 users, got %v", n)
+		}
+		if n := len(opts.Nkeys); n != 2 {
+			t.Fatalf("Should have 2 nkeys, got %v", n)
+		}
+	}
+	// Repeat test since issue was with ordering of processing
+	// of authorization vs accounts that depends on range of a map (after actual parsing)
+	for i := 0; i < 20; i++ {
+		check(t)
 	}
 }
